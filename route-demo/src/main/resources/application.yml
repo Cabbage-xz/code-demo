@@ -1,0 +1,38 @@
+spring:
+  application:
+    name: route-demo
+
+
+route:
+  default-key: default
+  strict-mode: false
+  mappings:
+    beta_fault:
+      module: faultDetailMapper
+      suffix: /betaSuffix
+      description: Beta-env
+
+
+    comm_fault:
+      module: faultDetailMapper
+      suffix: /commSuffix
+      description: Comm-env
+      enabled: true
+
+    beta_other_app:
+      module: otherAppFaultDetailMapper
+      suffix: /betaSuffix
+      description: Beta-other-app
+      enabled: true
+
+    comm_other_app:
+      module: otherAppFaultDetailMapper
+      suffix: /commSuffix
+      description: Comm-other-app
+      enabled: true
+
+    default:
+      module: faultDetailMapper
+      suffix: /betaSuffix
+      description: default
+      enabled: true
