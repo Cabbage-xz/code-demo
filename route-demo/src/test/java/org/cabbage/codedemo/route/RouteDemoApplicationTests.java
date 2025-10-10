@@ -1,13 +1,13 @@
-package org.cabbage.codedemo;
+package org.cabbage.codedemo.route;
 
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.SpringBootTest;
 
 @SpringBootTest
-class CodeDemoApplicationTests {
+class RouteDemoApplicationTests {
 
-	@Test
-	void contextLoads() {
-	}
+    @Test
+    void contextLoads() {
+    }
 
 }

@@ -9,10 +9,10 @@
         <relativePath/> <!-- lookup parent from repository -->
     </parent>
     <groupId>org.cabbage.codedemo</groupId>
-    <artifactId>code-demo</artifactId>
+    <artifactId>route</artifactId>
     <version>0.0.1-SNAPSHOT</version>
-    <name>code-demo</name>
-    <description>code-demo</description>
+    <name>route-demo</name>
+    <description>route-demo</description>
     <url/>
     <licenses>
         <license/>
