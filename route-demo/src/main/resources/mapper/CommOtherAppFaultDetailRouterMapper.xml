@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="org.cabbage.codedemo.route.mapper.CommOtherAppFaultDetailRouterMapper">
+
+
+    <select id="queryFaultDetail" resultType="java.lang.String">
+        SELECT 'comm-other-app-queryFaultDetail' AS result
+    </select>
+
+    <select id="queryFaultDistribution" resultType="java.lang.String">
+        SELECT 'comm-other-app-queryFaultDistribution' AS result
+    </select>
+
+    <select id="countFaults" resultType="java.lang.String">
+        SELECT 'comm-other-app-countFaults' AS result
+    </select>
+
+
+
+</mapper>

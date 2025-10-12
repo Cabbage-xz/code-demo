@@ -1,6 +1,11 @@
 spring:
   application:
     name: route-demo
+  datasource:
+    driverClassName: com.mysql.cj.jdbc.Driver
+    username: root
+    password: 1234567a
+    url: jdbc:mysql://127.0.0.1:3306/code_demo?useUnicode=true&characterEncoding=UTF-8&rewriteBatchedStatements=true&allowMultiQueries=true&serverTimezone=Asia/Shanghai
 
 
 route:
@@ -8,31 +13,32 @@ route:
   strict-mode: false
   mappings:
     beta_fault:
-      module: faultDetailMapper
+      module: faultDetail
       suffix: /betaSuffix
       description: Beta-env
+      enabled: true
 
 
     comm_fault:
-      module: faultDetailMapper
+      module: faultDetail
       suffix: /commSuffix
       description: Comm-env
       enabled: true
 
     beta_other_app:
-      module: otherAppFaultDetailMapper
+      module: otherAppFaultDetail
       suffix: /betaSuffix
       description: Beta-other-app
       enabled: true
 
     comm_other_app:
-      module: otherAppFaultDetailMapper
+      module: otherAppFaultDetail
       suffix: /commSuffix
       description: Comm-other-app
       enabled: true
 
     default:
-      module: faultDetailMapper
+      module: faultDetail
       suffix: /betaSuffix
       description: default
       enabled: true

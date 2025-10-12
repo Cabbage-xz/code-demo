@@ -14,12 +14,12 @@ import lombok.NoArgsConstructor;
 @NoArgsConstructor
 public class RouteConfig {
     /**
-     * 模块名称，对应 @RouteMapper 的 module
+     * 模块名称，对应 @RouteCustom 的 module
      */
     private String module;
 
     /**
-     * 路由后缀，对应 @RouteMapper 的 value
+     * 路由后缀，对应 @RouteCustom 的 value
      */
     private String suffix;
 

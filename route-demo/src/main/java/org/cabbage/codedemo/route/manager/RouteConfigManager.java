@@ -52,7 +52,6 @@ public class RouteConfigManager {
      * 初始化路由配置
      * 在Bean创建后自动执行
      */
-    // todo 注册不能在这里注册 应该在factory中注册
     @PostConstruct
     public void initRouteConfig() {
         log.info("============== init route config ==============");
@@ -61,7 +60,7 @@ public class RouteConfigManager {
         routeConfigMap.clear();
 
         // 注册路由配置
-        if (routeConfigProperties != null && CollUtil.isNotEmpty(routeConfigMap)) {
+        if (routeConfigProperties != null && CollUtil.isNotEmpty(routeConfigProperties.getMappings())) {
             registerConfigByFileRoutes();
         }
 

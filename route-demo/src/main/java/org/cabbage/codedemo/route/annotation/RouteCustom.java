@@ -14,7 +14,7 @@ import java.lang.annotation.Target;
 @Target({ElementType.TYPE})
 @Retention(RetentionPolicy.RUNTIME)
 @Inherited
-public @interface RouteMapper {
-    String value();           // 映射的路由后缀,如 "/betaSuffix" 或 "/commSuffix"
-    String module() default ""; // 模块名称,如 "faultDetailMapper"
+public @interface RouteCustom {
+    String suffix();           // 映射的路由后缀,如 "/betaSuffix" 或 "/commSuffix"
+    String moduleName() default ""; // 模块名称,如 "faultDetailMapper"
 }
