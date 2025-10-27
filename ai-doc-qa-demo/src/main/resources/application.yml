@@ -4,7 +4,7 @@ spring:
 server:
   port: 8080
 
-# DeepSeek ??
+# DeepSeek 配置
 deepseek:
   api-key: sk-af9220b3ac28480d9e2e64b71a0b127c
   base-url: https://api.deepseek.com/v1
@@ -13,19 +13,19 @@ deepseek:
   max-tokens: 2000
   timeout: 60
 
-# ????
+# 文档配置
 document:
   base-path: classpath:documents
   chunk-size: 500
   chunk-overlap: 50
   max-chunks: 100
 
-# RAG ??
+# RAG配置
 rag:
   max-results: 3
-  min-score: 0.3
+  min-score: 0.7
 
-# ????
+# 日志配置
 logging:
   level:
     com.example.aidoc: DEBUG

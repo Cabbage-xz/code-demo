@@ -198,7 +198,7 @@ public class DocumentService {
 
         // 过滤掉 null 值并提取 TextSegment
         List<TextSegment> segments = matches.stream()
-                .filter(match -> match != null && match.embedded() != null)  // 过滤 null
+                .filter(match -> match != null && match.embedded() != null)
                 .map(EmbeddingMatch::embedded)
                 .collect(Collectors.toList());
 

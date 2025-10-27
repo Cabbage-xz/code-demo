@@ -35,9 +35,15 @@ public class LangChainConfig {
                 .apiKey(deepSeekConfig.getApiKey())
                 .baseUrl(deepSeekConfig.getBaseUrl())
                 .modelName(deepSeekConfig.getModel())
+                // 控制回答的"创造性"程度 取值范围：0.0 ~ 2.0
+                // 0.0完全确定 每次相同问题给出相同答案
+                // 1.0平衡创造性和准确性
+                // 2.0高度随机、答案天马行空
                 .temperature(deepSeekConfig.getTemperature())
+                // 单次回答最大长度
                 .maxTokens(deepSeekConfig.getMaxTokens())
                 .timeout(Duration.ofSeconds(deepSeekConfig.getTimeout()))
+                // 记录所有发送到DeepSeek的请求和收到的响应
                 .logRequests(true)
                 .logResponses(true)
                 .build();

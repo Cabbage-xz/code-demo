@@ -50,7 +50,7 @@ public class AiChatService {
         // 调用DeepSeek生成答案
         String answer = chatModel.generate(prompt);
         // 提取来源
-        List<String> sources = extracrSource(relevantDocs);
+        List<String> sources = extractSource(relevantDocs);
 
         return ChatResp.builder()
                 .answer(answer)
@@ -131,7 +131,7 @@ public class AiChatService {
      * @param relevantDocs 文档
      * @return 文档来源
      */
-    private List<String> extracrSource(List<TextSegment> relevantDocs) {
+    private List<String> extractSource(List<TextSegment> relevantDocs) {
         return relevantDocs.stream()
                 .map(doc -> doc.metadata("source"))
                 .distinct()
