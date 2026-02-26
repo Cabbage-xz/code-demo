@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.cabbage.codedemo.faultdatasync.mapper.FaultRecordMapper">
+
+    <!-- 批量 INSERT IGNORE：唯一索引 (domain, data_date, rank) 防 MQ 重投重复写入 -->
+    <insert id="batchInsert" parameterType="list">
+        INSERT IGNORE INTO fault_record
+            (domain, data_date, rank, fault_type, device_id, fault_detail)
+        VALUES
+        <foreach collection="list" item="item" separator=",">
+            (#{item.domain}, #{item.dataDate}, #{item.rank},
+             #{item.faultType}, #{item.deviceId}, #{item.faultDetail})
+        </foreach>
+    </insert>
+
+    <!-- 按 domain + data_date 全量删除，重同步前清空旧数据 -->
+    <delete id="deleteByDomainAndDate">
+        DELETE FROM fault_record
+        WHERE domain = #{domain}
+          AND data_date = #{dataDate}
+    </delete>
+
+</mapper>

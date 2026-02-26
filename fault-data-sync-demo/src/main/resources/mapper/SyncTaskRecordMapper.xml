@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.cabbage.codedemo.faultdatasync.mapper.SyncTaskRecordMapper">
+
+    <!--
+        原子操作：已完成批次数加 1。
+        当 completed_batch_count + 1 == batch_count 时，说明所有批次消费完成，
+        同时将状态更新为 SUCCESS，并记录结束时间。
+    -->
+    <update id="incrementCompletedBatch">
+        UPDATE sync_task_record
+        SET completed_batch_count = completed_batch_count + 1,
+            status = CASE
+                WHEN completed_batch_count + 1 >= #{batchCount} THEN 'SUCCESS'
+                ELSE status
+            END,
+            end_time = CASE
+                WHEN completed_batch_count + 1 >= #{batchCount} THEN NOW()
+                ELSE end_time
+            END
+        WHERE domain    = #{domain}
+          AND data_date = #{dataDate}
+          AND status    = 'MESSAGES_SENT'
+    </update>
+
+</mapper>

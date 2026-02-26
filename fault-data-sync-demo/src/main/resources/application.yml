@@ -1,0 +1,83 @@
+spring:
+  application:
+    name: fault-data-sync-demo
+  datasource:
+    url: jdbc:mysql://127.0.0.1:3306/code_demo?useUnicode=true&characterEncoding=UTF-8&rewriteBatchedStatements=true&serverTimezone=Asia/Shanghai
+    username: root
+    password: 1234567a
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+# MyBatis-Plus
+mybatis-plus:
+  mapper-locations: classpath:mapper/*.xml
+  configuration:
+    log-impl: org.apache.ibatis.logging.slf4j.Slf4jImpl
+    map-underscore-to-camel-case: true
+  global-config:
+    db-config:
+      id-type: AUTO
+
+# RocketMQ
+rocketmq:
+  name-server: 127.0.0.1:9876
+  producer:
+    group: fault-data-sync-producer
+    send-message-timeout: 3000
+    retry-times-when-send-failed: 2
+
+# PowerJob Worker
+powerjob:
+  worker:
+    enabled: true
+    app-name: fault-data-sync-demo
+    server-address: 127.0.0.1:7700
+    protocol: HTTP
+    # 心跳间隔（秒）
+    heart-beat-rate: 10
+
+# 故障数据同步任务配置
+fault-sync:
+  # 领域列表（20 个领域，PowerJob instanceParams 可覆盖）
+  domains:
+    - domain_a
+    - domain_b
+    - domain_c
+    - domain_d
+    - domain_e
+    - domain_f
+    - domain_g
+    - domain_h
+    - domain_i
+    - domain_j
+    - domain_k
+    - domain_l
+    - domain_m
+    - domain_n
+    - domain_o
+    - domain_p
+    - domain_q
+    - domain_r
+    - domain_s
+    - domain_t
+  # 向前同步天数（D-1 至 D-N，覆盖历史延迟更新）
+  sync-days: 5
+  # 并行线程池大小（建议等于领域数）
+  thread-pool-size: 20
+  # DB 批量插入每批大小
+  batch-size: 1000
+  # 数据源单次拉取页大小
+  page-size: 5000
+  # Mock 数据源每个 domain+date 的数据总量（正常：20000；顶峰：1000000）
+  mock-total-per-domain: 20000
+  # MQ Topic 配置
+  mq:
+    topic: fault-data-sync-topic
+    consumer-group: fault-data-sync-consumer
+
+server:
+  port: 8083
+
+logging:
+  level:
+    org.cabbage.codedemo.faultdatasync: DEBUG
+    com.baomidou.mybatisplus: WARN
