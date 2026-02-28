@@ -6,7 +6,7 @@ server:
 
 # DeepSeek 配置
 deepseek:
-  api-key: sk-af9220b3ac28480d9e2e64b71a0b127c
+  api-key: ${DEEPSEEK_API_KEY:}  # 从环境变量读取，如果没有则为空字符串
   base-url: https://api.deepseek.com/v1
   model: deepseek-chat
   temperature: 0.7
