@@ -26,16 +26,19 @@ The fault-data-sync-demo module implements a reliable, large-scale daily fault-l
 ### Overall Sync Flow
 
 ```
-PowerJob Server (daily trigger)
-        │
+PowerJob Server (per-domain daily trigger)
+        │  (each domain has its own PowerJob task, all pointing to FaultDataSyncJob)
         ▼
 FaultDataSyncJob.process()
         │
-        ├── Build task list: 20 domains × 5 days = up to 100 (domain, date) pairs
+        ├── Parse single domain from instanceParams (e.g. {"domain":"domain_a","syncDays":5})
         │
-        ├── Submit to bounded thread pool (default 20 threads)
+        ├── Build 5 sync dates (D-1 to D-syncDays)
         │
-        │   [each parallel task] FaultSyncServiceImpl.syncDomainDate(domain, date)
+        ├── Submit 5 CompletableFutures to shared bounded thread pool (20 threads)
+        │   (20 concurrent PowerJob tasks share the same syncExecutor as a global rate limiter)
+        │
+        │   [each date task] FaultSyncServiceImpl.syncDomainDate(domain, date)
         │           │
         │           ├── 1. sync_task_record → RUNNING
         │           ├── 2. DELETE fault_record WHERE domain=? AND data_date=?
@@ -165,8 +168,11 @@ CREATE TABLE sync_task_record (
 This handles both PowerJob task re-runs and MQ message redelivery.
 
 ### Parallelism & Back-pressure
+- **Domain-level parallelism**: each domain has its own PowerJob task; PowerJob concurrently schedules up to 20 task instances
+- **Date-level parallelism**: each task instance submits 5 `CompletableFuture` tasks (D-1 to D-syncDays) to a shared `syncExecutor`
 - `ThreadPoolExecutor(20, 20, 60s, ArrayBlockingQueue(100), CallerRunsPolicy)`
-- `CallerRunsPolicy`: when queue is full, the submitting thread executes the task — natural back-pressure, no OOM risk
+  - Pool serves as a **global rate limiter** across all concurrent domain tasks
+  - `CallerRunsPolicy`: when pool + queue are saturated, the PowerJob worker thread executes the task itself — natural back-pressure on the PowerJob executor, no OOM risk
 
 ### Progress Tracking
 `sync_task_record.incrementCompletedBatch` uses a single atomic UPDATE:
@@ -212,8 +218,7 @@ WHERE domain = #{domain} AND data_date = #{dataDate} AND status = 'MESSAGES_SENT
 
 ```yaml
 fault-sync:
-  domains: [domain_a, ..., domain_t]   # 20 domains
-  sync-days: 5                          # resync D-1 through D-5
+  sync-days: 5                          # resync D-1 through D-5 (overridable per task via instanceParams)
   thread-pool-size: 20
   batch-size: 1000                      # DB insert chunk size
   page-size: 5000                       # upstream API page size
@@ -241,12 +246,13 @@ mysql -u root -p code_demo < src/main/resources/sql/init.sql
 cd fault-data-sync-demo
 ./mvnw spring-boot:run
 
-# 3. Register job in PowerJob console
+# 3. Register one PowerJob task per domain in PowerJob console
 #    Handler: org.cabbage.codedemo.faultdatasync.job.FaultDataSyncJob
-#    jobParams (optional): {"domains":["domain_a","domain_b"],"syncDays":5}
+#    instanceParams (required): {"domain":"domain_a","syncDays":5}
+#    Repeat for domain_b ... domain_t (20 tasks total)
 
 # 4. Trigger manually and observe:
-#    - PowerJob logs: parallel domain tasks executing
+#    - PowerJob logs: single domain processing 5 dates in parallel
 #    - RocketMQ console: messages in fault-data-sync-topic
 #    - MySQL: fault_record rows inserted, sync_task_record status → SUCCESS
 ```

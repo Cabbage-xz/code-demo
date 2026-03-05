@@ -81,4 +81,46 @@ Use this template for each new entry:
   - `fault-data-sync-demo/REQUESTS_AND_MODIFICATIONS.md`
 - **Status**: Completed
 
-[Future requests and modifications will be added here as they occur]
+---
+
+### Request 2: 新增面试准备文档
+- **Date**: 2026-02-26
+- **Request Details**: 为 `fault-data-sync-demo` 模块新增面试准备文档，覆盖高级开发/架构师视角下的常见问答，包含项目自述话术、技术问答（rank游标、MQ解耦、幂等设计、线程池、DLQ等）及延伸题。
+- **Modification Made**:
+  - 新增 `INTERVIEW_PREP.md`，包含：
+    - Section一：项目介绍自述稿 + 量化指标表
+    - Section二：15+ 道面试问答（含标准答案和追问应对）
+    - Section三：压力追问参考答案
+    - Section四：一句话速记表
+- **Files Modified**:
+  - `fault-data-sync-demo/INTERVIEW_PREP.md` (新增)
+- **Status**: Completed
+
+---
+
+### Request 3: 架构修正（单域处理器）+ 面试文档增补
+- **Date**: 2026-03-05
+- **Request Details**: 发现现有代码设计（单任务 + `jobParams` 传入所有域列表）与实际业务模型冲突。实际业务中每个领域在 PowerJob 中配置独立定时任务，处理器只负责单域5天同步。需同步修正代码、配置和文档。
+
+  面试文档同时增补以下内容：
+  - 一句话项目概括（HR/架构师视角）
+  - ③段改为"各领域独立 PowerJob 任务，通用处理器单域并发"
+  - Q2 追问：RocketMQ 选型理由 vs Kafka/RabbitMQ；无MQ方案对比分析
+  - Q5 线程池：说明双层作用（日期级并发 + 多域共享限速）
+  - 新增 Q：为什么各域独立配置 PowerJob 任务而非一个任务处理所有域
+  - 一句话速记新增"各域独立 PowerJob 任务"条目
+
+- **Modification Made**:
+  - `FaultDataSyncJob`：删除 `parseDomains()/defaultDomains`，新增 `parseDomain()` 读取单个 domain，移除外层 domain 循环，处理器只负责单域 × syncDays 天
+  - `application.yml`：删除 `fault-sync.domains` 列表（22行），领域配置下沉到 PowerJob 各任务的 instanceParams
+  - `INTERVIEW_PREP.md`：增补七处内容（见上述请求详情）
+  - `MODULE_DOCS.md`：同步更新架构流程图、Parallelism & Back-pressure 描述、Configuration Reference、Running Locally 步骤
+  - `REQUESTS_AND_MODIFICATIONS.md`：补录 Request 2、Request 3
+
+- **Files Modified**:
+  - `fault-data-sync-demo/src/main/java/org/cabbage/codedemo/faultdatasync/job/FaultDataSyncJob.java`
+  - `fault-data-sync-demo/src/main/resources/application.yml`
+  - `fault-data-sync-demo/INTERVIEW_PREP.md`
+  - `fault-data-sync-demo/MODULE_DOCS.md`
+  - `fault-data-sync-demo/REQUESTS_AND_MODIFICATIONS.md`
+- **Status**: Completed
