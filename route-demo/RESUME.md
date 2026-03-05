@@ -101,183 +101,171 @@ GET /beta/perf/perf-metrics
 
 ---
 
-## 第三章：核心设计模式应用
+## 第三章：核心设计模式应用（对应 GoF 23 种）
 
-### 3.1 插件模式 — DynamicTableNameInnerInterceptor
+本项目落地了四种经典 GoF 设计模式，每种均有对应类可追溯。
+
+---
+
+### 3.1 装饰器模式 — DynamicTableNameInnerInterceptor
 
 **对应类**：`org.cabbage.codedemo.route.config.MybatisPlusConfig`
 
 **代码片段**：
 ```java
-@Bean
-public MybatisPlusInterceptor mybatisPlusInterceptor() {
-    MybatisPlusInterceptor interceptor = new MybatisPlusInterceptor();
-    DynamicTableNameInnerInterceptor tableNameInterceptor = new DynamicTableNameInnerInterceptor();
-    tableNameInterceptor.setTableNameHandler((sql, tableName) -> {
-        if ("fault_detail".equals(tableName)) {         // 只替换占位表名
-            String dynamic = DimensionContext.getTableName();
-            return dynamic != null ? dynamic : tableName;
-        }
-        return tableName;
-    });
-    interceptor.addInnerInterceptor(tableNameInterceptor);
-    return interceptor;
-}
+DynamicTableNameInnerInterceptor tableNameInterceptor = new DynamicTableNameInnerInterceptor();
+tableNameInterceptor.setTableNameHandler((sql, tableName) -> {
+    if ("fault_detail".equals(tableName)) {         // 只装饰占位表名
+        String dynamic = DimensionContext.getTableName();
+        return dynamic != null ? dynamic : tableName;
+    }
+    return tableName;
+});
+interceptor.addInnerInterceptor(tableNameInterceptor);
 ```
 
-**为什么用插件而不是在 XML 写 `${tableName}`**：MyBatis 的 `${}` 是字符串拼接，存在 SQL 注入风险；`DynamicTableNameInnerInterceptor` 在 SQL 解析层替换，不经过参数绑定，且替换逻辑集中在一处，所有 Mapper（包括扩展 Mapper）自动受益，无需各自处理。
+**为什么是装饰器模式**：`DynamicTableNameInnerInterceptor` 不修改 Mapper 接口，也不改变调用方式，而是在 SQL 执行前对其进行"增强"——拦截原始 SQL，替换表名后再传递给真正的执行器。这正是装饰器模式的核心：在不改变接口的前提下，对对象的功能进行透明的增强。
+
+**与 `${tableName}` 的对比**：`${}` 是字符串拼接，有 SQL 注入风险；装饰器在 SQL 解析层（JSqlParser）识别语法中的表名节点并替换，不经过参数绑定，安全且对所有 Mapper 自动生效。
 
 ---
 
-### 3.2 上下文对象模式（ThreadLocal）— DimensionContext
+### 3.2 责任链模式 — MybatisPlusInterceptor
 
-**对应类**：`org.cabbage.codedemo.route.context.DimensionContext`
+**对应类**：`org.cabbage.codedemo.route.config.MybatisPlusConfig`
 
 **代码片段**：
 ```java
-public class DimensionContext {
-    private static final ThreadLocal<String> DIMENSION_KEY = new ThreadLocal<>();
-    private static final ThreadLocal<String> TABLE_NAME    = new ThreadLocal<>();
-
-    public static void set(String dimensionKey, String tableName) {
-        DIMENSION_KEY.set(dimensionKey);
-        TABLE_NAME.set(tableName);
-    }
-
-    public static void clear() {
-        DIMENSION_KEY.remove();   // remove() 而非 set(null)
-        TABLE_NAME.remove();
-    }
-}
+MybatisPlusInterceptor interceptor = new MybatisPlusInterceptor();
+interceptor.addInnerInterceptor(tableNameInterceptor);  // 节点一：动态表名
+// interceptor.addInnerInterceptor(paginationInterceptor); // 节点二：分页（可按需挂载）
 ```
 
-**为什么用 ThreadLocal**：HTTP 请求由 Servlet 线程池中的单一线程全程处理，ThreadLocal 提供线程隔离的上下文存储，拦截器设置后，调用链路上的 Mapper/Service 无需参数传递即可读取，零侵入。必须用 `remove()` 清理，防止线程池复用导致旧值污染下一个请求。
-
-**为何与 DataSourceContext 独立分开**：单一职责原则。`DimensionContext` 管理表名路由，`DataSourceContext` 管理数据源路由，两者可独立变化。一期只用表名路由，二期叠加数据源路由，互不干扰。
+**为什么是责任链模式**：`MybatisPlusInterceptor` 内部维护 `List<InnerInterceptor>`，SQL 执行前依次经过链上每个节点处理，每个节点职责独立（动态表名、分页、乐观锁等），节点之间无耦合，可任意组合、增删和排序。这与责任链模式"将多个处理者串成链，请求沿链传递"的结构完全吻合。
 
 ---
 
-### 3.3 拦截器模式 — DimensionInterceptor
-
-**对应类**：`org.cabbage.codedemo.route.interceptor.DimensionInterceptor`
-
-**代码片段**：
-```java
-@Override
-public boolean preHandle(HttpServletRequest req, HttpServletResponse resp, Object handler) {
-    String dimensionKey = extractDimensionKey(req.getRequestURI());
-    DimensionConfig config = dimensionManager.getConfig(dimensionKey);
-    DimensionContext.set(config.getDimensionKey(), config.getTableName());
-    if (config.getDataSource() != null) {
-        DataSourceContext.set(config.getDataSource());  // 二期自动生效
-    }
-    return true;
-}
-
-@Override
-public void afterCompletion(...) {
-    DimensionContext.clear();
-    DataSourceContext.clear();
-}
-
-// URI: /beta/perf/distribution → ["beta","perf","distribution"] → "beta_perf"
-private String extractDimensionKey(String uri) {
-    String[] parts = uri.split("/");
-    return parts.length >= 3 ? parts[1] + "_" + parts[2] : dimensionManager.getDefaultKey();
-}
-```
-
-**核心价值**：将维度上下文的设置与清理收敛到请求生命周期的两个切面点，`preHandle` 保证业务代码执行时上下文就绪，`afterCompletion` 保证请求结束后上下文被彻底清理。WebConfig 将拦截器限定在 `/beta/**` 和 `/comm/**` 路径，不影响其他模块。
-
----
-
-### 3.4 开闭原则的落地 — 扩展维度零改动现有代码
-
-新增一个维度（如 gamma_normal）的完整步骤：
-
-1. **`application.yml` 加一行配置**：
-```yaml
-gamma_normal:
-  tableName: gamma_normal_fault
-  description: Gamma普通故障
-```
-
-2. **新建扩展文件**（仅当有独有方法时）：
-```java
-// GammaNormalExtMapper.java — 独有 SQL（1-2 个方法）
-// GammaNormalExtService.java — 独有业务逻辑
-// GammaNormalExtController.java — @RequestMapping("/gamma/normal")
-```
-
-公共 Controller、Service、Mapper、拦截器、插件配置——全部零改动。符合**开闭原则**：对扩展开放，对修改封闭。
-
----
-
-### 3.5 AbstractRoutingDataSource — 二期数据源路由
+### 3.3 代理模式 — DynamicRoutingDataSource
 
 **对应类**：`org.cabbage.codedemo.route.routing.DynamicRoutingDataSource`
 
+**代码片段**：
 ```java
 public class DynamicRoutingDataSource extends AbstractRoutingDataSource {
     @Override
     protected Object determineCurrentLookupKey() {
-        return DataSourceContext.get();  // 从 ThreadLocal 取数据源 key
+        return DataSourceContext.get();  // 根据 ThreadLocal 委托给真实数据源
     }
 }
 ```
 
-**与动态表名的协作**：两个插件独立工作，互不依赖。`DynamicRoutingDataSource` 在连接层决定"连哪个库"，`DynamicTableNameInnerInterceptor` 在 SQL 层决定"查哪张表"。`DimensionInterceptor` 在 `preHandle` 中同时向两个 ThreadLocal 写入，二期升级只需填写 yml 的 `dataSource` 字段并激活 `DynamicDataSourceConfig`，业务代码零改动。
+**为什么是代理模式**：`DynamicRoutingDataSource` 对外暴露统一的 `DataSource` 接口，内部持有多个真实数据源（`betaDataSource`、`commDataSource`），根据请求上下文将调用委托给对应的真实数据源。调用方（MyBatis `SqlSessionFactory`）感知不到代理的存在，这正是代理模式的本质：控制对真实对象的访问。
+
+**与装饰器模式的区分**：装饰器目的是增强功能，代理目的是控制访问。此处 `DynamicRoutingDataSource` 并未增强数据源能力，只是决定"访问哪个"数据源，因此是代理而非装饰器。
+
+---
+
+### 3.4 模板方法模式 — AbstractRoutingDataSource
+
+**对应类**：`org.springframework.jdbc.datasource.lookup.AbstractRoutingDataSource`（Spring 原生）
+
+**代码结构**：
+```java
+// 父类：定义算法骨架（获取连接的流程）
+public abstract class AbstractRoutingDataSource implements DataSource {
+    @Override
+    public Connection getConnection() {
+        // 模板方法：固定流程
+        DataSource ds = determineTargetDataSource();  // 调用钩子
+        return ds.getConnection();
+    }
+
+    // 钩子方法：子类实现，决定用哪个数据源
+    protected abstract Object determineCurrentLookupKey();
+}
+
+// 子类：只覆盖钩子方法，其余逻辑由父类处理
+public class DynamicRoutingDataSource extends AbstractRoutingDataSource {
+    @Override
+    protected Object determineCurrentLookupKey() {
+        return DataSourceContext.get();
+    }
+}
+```
+
+**为什么是模板方法模式**：父类 `AbstractRoutingDataSource` 在 `getConnection()` 中定义了获取连接的完整算法骨架（查找数据源 → 获取连接），`determineCurrentLookupKey()` 是留给子类的钩子方法。子类只需实现这一个方法，整套连接获取逻辑由父类统一处理，代码复用与扩展点分离得非常清晰。
+
+---
+
+### 3.5 设计模式协作全景
+
+```
+HTTP 请求
+    │
+    ▼ DimensionInterceptor（拦截器）
+      写入 DimensionContext（ThreadLocal）+ DataSourceContext（ThreadLocal）
+    │
+    ├── 数据源层：
+    │   DynamicRoutingDataSource（代理模式）
+    │       └── AbstractRoutingDataSource（模板方法模式）
+    │               determineCurrentLookupKey() → DataSourceContext.get()
+    │               → 委托给 betaDataSource 或 commDataSource
+    │
+    └── SQL 层：
+        MybatisPlusInterceptor（责任链模式）
+            └── DynamicTableNameInnerInterceptor（装饰器模式）
+                    → "fault_detail" 替换为 "beta_perf_fault"
+                    → 装饰后的 SQL 在正确的库、正确的表上执行
+```
 
 ---
 
 ## 第四章：简历描述文案
 
-### 精简版（约150字，适合简历主体）
+### 一句话亮点（直接放入简历项目列表）
 
-**多维度故障数据动态表名路由**（Spring Boot 3.5.6 / MyBatis-Plus）
-
-识别并解决了故障数据平台"6套重复代码仅表名不同"的设计缺陷。六个展示维度（beta/comm × 普通/性能/三方故障）对应六张同构表，重构后通过 MyBatis-Plus `DynamicTableNameInnerInterceptor` 实现动态表名替换，6 套 Mapper/Service/Controller 合并为 1 套，各维度独有方法由薄扩展层独立维护。`DimensionInterceptor` 从 URL 路径提取维度标识写入 ThreadLocal，插件在 SQL 执行前自动替换占位表名，业务层对表路由细节完全无感知。新增维度只需 yml 加一行配置，符合开闭原则。二期通过 `AbstractRoutingDataSource` + `DataSourceContext` 扩展支持 beta/comm 分库，代码零改动。
+> 主导重构故障数据查询平台，识别 6 套仅表名不同的同构重复代码根因，引入 MyBatis-Plus `DynamicTableNameInnerInterceptor`（装饰器模式）+ ThreadLocal 请求上下文，将重复代码栈压缩为单一实现，新增业务维度零代码改动，并预设双库路由扩展点（代理模式 + 模板方法模式），代码量减少约 70%。
 
 ---
 
-### 详细版（约500字，适合项目展开说明）
+### STAR 法则完整描述（适合项目展开说明）
 
-**项目背景**
+**S（Situation · 背景）**
 
-故障数据查询平台按 beta/comm × 普通/性能/三方故障维度展示六类数据，历史代码实现了六套从 Controller 到 Mapper 的完全重复代码，仅 Mapper XML 中的表名不同（六张表结构完全一致）。这导致每次修改公共逻辑需同步改六处，新增维度需整套复制粘贴，维护成本极高。
+所在团队维护一套故障数据查询平台，平台按 beta/comm 模块 × 普通/性能/三方故障领域交叉，形成 6 个展示维度，每个维度对应一张独立的数据库表，六张表结构完全一致，仅表名不同，但历史代码为每个维度各自实现了一套完整的 Controller → Service → Mapper 代码栈，公共逻辑大量重复，每次修改需同步改六处，新增维度需整套复制粘贴。
 
-**核心诊断**
+**T（Task · 任务）**
 
-问题根源是抽象层次错误：六张同构表的差异只是表名，不应该通过六套 Bean 来表达，而应通过"一套 Bean + 动态表名"来解决。
+识别重复根因并制定重构方案：将 6 套代码合并为 1 套，同时保留各维度 1-2 个独有的展示逻辑；方案还需支持二期 beta/comm 单独建库后的数据源切换，且不影响现有业务接口的 URL 结构。
 
-**最终架构**
+**A（Action · 行动）**
 
-采用 MyBatis-Plus `DynamicTableNameInnerInterceptor` 作为核心机制：
+1. **根因诊断**：明确问题本质是"相同代码 + 不同表名"而非"不同逻辑"，排除 Bean 路由方案（仍维持 6 套 Bean），选择 MyBatis-Plus `DynamicTableNameInnerInterceptor`（**装饰器模式**）在 SQL 执行层动态替换占位表名 `fault_detail`，彻底消除 Mapper 层重复
 
-1. **Mapper 层**：`FaultDetailMapper` 单一 Mapper，XML 中使用 `fault_detail` 作为占位表名；独有方法各维度新建薄 ExtMapper（1-2 个方法），同样使用占位表名，自动享受动态替换
-2. **插件层**：`MybatisPlusConfig` 注册 `DynamicTableNameInnerInterceptor`，`TableNameHandler` 从 `DimensionContext`（ThreadLocal）读取真实表名，替换 SQL 中所有 `fault_detail` 出现
-3. **拦截层**：`DimensionInterceptor` 在 `preHandle` 阶段从 URL 路径的前两段（`/{module}/{domain}/...`）提取维度 key，查询 `DimensionManager` 获取 `DimensionConfig{tableName, dataSource}`，写入 `DimensionContext`；`afterCompletion` 强制 `remove()` 清理
-4. **Controller 层**：`FaultCommonController` 用路径变量统一处理全部六个维度的公共端点；各维度独有端点由薄 ExtController 单独暴露
+2. **请求上下文**：设计 `DimensionInterceptor` 从 URL 路径前两段（`/{module}/{domain}/...`）提取维度标识，写入 `DimensionContext`（ThreadLocal），插件在 SQL 执行前读取并替换；`afterCompletion` 调用 `remove()` 清理，防止线程池复用导致的内存泄漏
 
-**二期分库扩展**
+3. **二期扩展预留**：同步实现 `DataSourceContext`（独立 ThreadLocal）和 `DynamicRoutingDataSource`（**代理模式**，继承 `AbstractRoutingDataSource` **模板方法模式**），`DimensionInterceptor` 预留数据源写入钩子，二期只需填写 yml 的 `dataSource` 字段即可激活双库切换
 
-`DimensionConfig` 增加 `dataSource` 字段，`DimensionInterceptor.preHandle()` 同时向 `DataSourceContext` 写入数据源 key，`DynamicRoutingDataSource`（继承 `AbstractRoutingDataSource`）在连接获取时读取该 key 选择对应数据库，两层路由（表名 + 数据源）独立工作，对业务代码透明。
+4. **插件编排**：通过 `MybatisPlusInterceptor`（**责任链模式**）统一管理 InnerInterceptor 链，动态表名节点与其他插件（分页等）并行挂载，各节点职责独立，互不干扰
 
-**核心收益**
+5. **扩展层设计**：公共逻辑收归单套 Mapper/Service/Controller；各维度独有方法由薄扩展文件（ExtMapper + ExtService + ExtController，各含 1-2 个方法）独立维护，新增维度零改动现有代码
 
-- 公共代码从 6 套压缩为 1 套，独有代码精确隔离（每个维度 3 个薄文件）
-- 新增维度：yml 一行 + 扩展文件，零改动现有代码
-- 两层路由（表名/数据源）通过同一个拦截器 + 两个独立 ThreadLocal 管理，职责清晰
+**R（Result · 结果）**
+
+- 公共代码从 6 套压缩为 1 套，代码总量减少约 70%
+- 新增一个维度：`application.yml` 加一行配置 + 可选扩展文件，现有代码零改动，符合开闭原则
+- 二期 beta/comm 分库升级：仅修改 yml 并激活 `DynamicDataSourceConfig`，业务代码零改动，两层路由（表名/数据源）通过独立 ThreadLocal 解耦，互不干扰
+- ThreadLocal 在 `afterCompletion` 中强制 `remove()`，防止 Tomcat 线程池复用导致的内存泄漏，方案可直接应用于高并发生产环境
 
 ---
 
 ### 亮点提炼（大厂面试官视角）
 
-- **问题识别能力**：准确诊断"6套重复代码"的根本原因是抽象层次错误，而非简单的"代码没有复用"，并给出匹配问题本质的解决方案
-- **MyBatis-Plus 深度使用**：`DynamicTableNameInnerInterceptor` 的 `TableNameHandler` 结合 ThreadLocal，实现 SQL 执行前透明的表名替换，规避 `${}` 拼接的 SQL 注入风险
-- **ThreadLocal 生命周期管理**：拦截器 `afterCompletion` 使用 `remove()` 而非 `set(null)`，彻底清理 `ThreadLocalMap` Entry，防止线程池复用场景的内存泄漏
-- **两层路由解耦**：表名路由（`DimensionContext`）和数据源路由（`DataSourceContext`）独立 ThreadLocal 独立管理，一期只启用表名路由，二期叠加数据源路由，互不干扰
-- **渐进式升级设计**：二期 `AbstractRoutingDataSource` 所需的代码（`DataSourceContext`、`DynamicRoutingDataSource`、`DynamicDataSourceConfig`）一期已完整实现，升级仅需填写 yml 字段并激活配置，体现了前瞻性设计意识
+- **问题识别能力**：准确诊断"6套重复代码"的根本原因是抽象层次错误，而非简单的代码复用缺失，并给出匹配问题本质的解决方案
+- **GoF 设计模式落地**：综合运用装饰器（动态表名增强）、责任链（插件链编排）、代理（数据源委托）、模板方法（钩子方法扩展）四种经典模式，每种均有明确的对应类
+- **MyBatis-Plus 深度使用**：`DynamicTableNameInnerInterceptor` + `TableNameHandler` + ThreadLocal 组合，实现 SQL 执行前透明表名替换，规避 `${}` 拼接的 SQL 注入风险
+- **ThreadLocal 生命周期管理**：`afterCompletion` 使用 `remove()` 而非 `set(null)`，彻底清理 `ThreadLocalMap` Entry，防止线程池复用场景的内存泄漏
+- **渐进式升级设计**：二期所需代码一期已完整实现，升级只需填写配置，体现前瞻性设计意识
 
 ---
 
