@@ -17,10 +17,13 @@ Controllers
 Core Routing Components
 ├── BeanRouteFactory          # Central factory for managed routed beans
 ├── RouteCustom               # Annotation for routing configuration
-├── RouteContext              # Thread-local context for routing
-├── RouteConfig               # Routing configuration model
+├── RouteContext              # Thread-local context for routing (routeKey/suffix/module)
+├── DataSourceContext         # Thread-local context for datasource key
+├── RouteConfig               # Routing configuration model (incl. dataSource field)
 ├── RouteConfigManager        # Manages routing configurations
-└── RouteInterceptor          # Intercepts requests to set routing context
+├── RouteInterceptor          # Intercepts requests to set routing + datasource context
+├── DynamicRoutingDataSource  # AbstractRoutingDataSource impl, reads DataSourceContext
+└── DynamicDataSourceConfig   # Registers beta/comm datasources, builds dynamic datasource
 
 Data Access Layer
 ├── Entities                  # Different entities for different environments
@@ -45,6 +48,9 @@ Helper Components
 ├── WebConfig                 # Web configuration
 ├── RouteConfigProperties     # Configuration properties
 └── GlobalExceptionHandler    # Global exception handling
+
+Resume Material
+└── RESUME.md                 # Full Chinese resume doc with architecture analysis, design patterns, and 27 interview Q&As
 ```
 
 ## Key Features
@@ -67,6 +73,14 @@ Helper Components
 ### Request Interception
 - `RouteInterceptor` analyzes incoming requests to determine routing context
 - Automatic setup of routing context based on request path or parameters
+- Sets both `RouteContext` (module/suffix) and `DataSourceContext` (datasource key) in `preHandle`
+- Clears both contexts in `afterCompletion` to prevent ThreadLocal memory leaks
+
+### Multi-DataSource Routing
+- `RouteConfig` carries a `dataSource` field binding each route key to a datasource key (e.g., `beta`, `comm`)
+- `DynamicRoutingDataSource` extends Spring's `AbstractRoutingDataSource`, delegates lookup key to `DataSourceContext`
+- `DynamicDataSourceConfig` registers `betaDataSource` and `commDataSource` HikariCP pools and assembles `DynamicRoutingDataSource` as the `@Primary` datasource
+- MyBatis/Spring JDBC transparently connects to the correct database per request, no business-layer changes required
 
 ## Core Concepts
 
@@ -79,6 +93,10 @@ Used to mark beans that should participate in routing. Contains:
 Thread-local storage that maintains routing information during request processing:
 - `moduleName`: The logical module name
 - `routeSuffix`: The specific routing identifier
+- `routeKey`: The original route key extracted from URL
+
+### DataSourceContext
+Separate thread-local that holds the datasource key for the current request. Decoupled from `RouteContext` so datasource switching can evolve independently. Must be cleared in `afterCompletion` alongside `RouteContext`.
 
 ### Bean Registration Process
 1. At startup, the `BeanRouteFactory` scans for `@RouteCustom` annotated beans
@@ -98,7 +116,7 @@ The module includes example endpoints demonstrating routing:
 - **ORM**: MyBatis-Plus 3.5.6
 - **Database**: MySQL
 - **Utilities**: Hutool-all 5.8.27
-- **Pattern**: Factory pattern, Context pattern, Annotation processing
+- **Pattern**: Factory pattern, Strategy pattern, Template Method, Facade, Context pattern, Annotation processing
 
 ## Dependencies
 - Spring Boot Web
