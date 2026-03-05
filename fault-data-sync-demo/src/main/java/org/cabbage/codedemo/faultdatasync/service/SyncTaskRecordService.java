@@ -29,4 +29,10 @@ public interface SyncTaskRecordService {
      * MQ 消费端调用：已完成批次数 +1，若达到 batchCount 则自动置为 SUCCESS
      */
     void incrementCompletedBatch(String domain, LocalDate dataDate);
+
+    /**
+     * Producer 补偿检查：updateMessagesSent 之后调用，
+     * 应对所有批次均早于 updateMessagesSent 消费完成的极端场景。
+     */
+    void checkAndMarkSuccessIfAllDone(String domain, LocalDate dataDate);
 }

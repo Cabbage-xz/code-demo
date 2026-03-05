@@ -8,7 +8,6 @@ import org.apache.rocketmq.spring.core.RocketMQListener;
 import org.cabbage.codedemo.faultdatasync.entity.FaultRecordEntity;
 import org.cabbage.codedemo.faultdatasync.mapper.FaultRecordMapper;
 import org.cabbage.codedemo.faultdatasync.model.FaultDataBatchMessage;
-import org.cabbage.codedemo.faultdatasync.model.FaultRecordDTO;
 import org.cabbage.codedemo.faultdatasync.service.SyncTaskRecordService;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;

@@ -5,23 +5,40 @@
 
     <!--
         原子操作：已完成批次数加 1。
-        当 completed_batch_count + 1 == batch_count 时，说明所有批次消费完成，
-        同时将状态更新为 SUCCESS，并记录结束时间。
+        放宽 WHERE 条件至 RUNNING/MESSAGES_SENT，解决消费者早于 updateMessagesSent 执行时计数丢失的问题。
+        SUCCESS 触发条件直接引用 DB 列 batch_count，并加 batch_count > 0 守卫，
+        防止 RUNNING 阶段（batch_count=0）被误判为完成。
     -->
     <update id="incrementCompletedBatch">
         UPDATE sync_task_record
         SET completed_batch_count = completed_batch_count + 1,
             status = CASE
-                WHEN completed_batch_count + 1 >= #{batchCount} THEN 'SUCCESS'
+                WHEN completed_batch_count + 1 >= batch_count AND batch_count > 0 THEN 'SUCCESS'
                 ELSE status
             END,
             end_time = CASE
-                WHEN completed_batch_count + 1 >= #{batchCount} THEN NOW()
+                WHEN completed_batch_count + 1 >= batch_count AND batch_count > 0 THEN NOW()
                 ELSE end_time
             END
         WHERE domain    = #{domain}
           AND data_date = #{dataDate}
+          AND status    IN ('RUNNING', 'MESSAGES_SENT')
+    </update>
+
+    <!--
+        Producer 补偿检查：updateMessagesSent 写入 batch_count 后立即调用。
+        处理"所有批次均早于 updateMessagesSent 消费完成"的场景：
+        此时 completed_batch_count 已等于 batch_count，但无消费者再触发 SUCCESS，需由 Producer 补触发。
+    -->
+    <update id="checkAndMarkSuccessIfAllDone">
+        UPDATE sync_task_record
+        SET status   = 'SUCCESS',
+            end_time = NOW()
+        WHERE domain    = #{domain}
+          AND data_date = #{dataDate}
           AND status    = 'MESSAGES_SENT'
+          AND batch_count > 0
+          AND completed_batch_count >= batch_count
     </update>
 
 </mapper>

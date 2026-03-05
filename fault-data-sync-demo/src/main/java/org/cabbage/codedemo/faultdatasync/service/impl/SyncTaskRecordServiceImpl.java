@@ -78,15 +78,19 @@ public class SyncTaskRecordServiceImpl implements SyncTaskRecordService {
 
     @Override
     public void incrementCompletedBatch(String domain, LocalDate dataDate) {
-        // 先查出 batchCount，再做原子 UPDATE（SQL 中直接判断是否完成）
-        SyncTaskRecordEntity record = findByDomainAndDate(domain, dataDate);
-        if (record == null) {
-            log.warn("[SyncTask] incrementCompletedBatch: 未找到记录 domain={} date={}", domain, dataDate);
-            return;
-        }
-        int affected = syncTaskRecordMapper.incrementCompletedBatch(domain, dataDate, record.getBatchCount());
+        // SQL 直接引用 DB 列 batch_count，无需额外 SELECT
+        int affected = syncTaskRecordMapper.incrementCompletedBatch(domain, dataDate);
         if (affected == 0) {
-            log.debug("[SyncTask] incrementCompletedBatch: UPDATE 无影响 (已非 MESSAGES_SENT 状态) domain={} date={}",
+            log.warn("[SyncTask] incrementCompletedBatch: UPDATE 无影响 (记录不存在或已非活跃状态) domain={} date={}",
+                    domain, dataDate);
+        }
+    }
+
+    @Override
+    public void checkAndMarkSuccessIfAllDone(String domain, LocalDate dataDate) {
+        int affected = syncTaskRecordMapper.checkAndMarkSuccessIfAllDone(domain, dataDate);
+        if (affected > 0) {
+            log.info("[SyncTask] checkAndMarkSuccessIfAllDone: 所有批次已提前消费完成，补触发 SUCCESS domain={} date={}",
                     domain, dataDate);
         }
     }

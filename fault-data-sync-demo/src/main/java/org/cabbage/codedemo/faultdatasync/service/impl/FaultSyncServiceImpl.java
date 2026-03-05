@@ -83,6 +83,9 @@ public class FaultSyncServiceImpl implements FaultSyncService {
             log.info("[Sync] domain={} date={} 同步完成，共 {} 批，{} 条记录",
                     domain, date, batchIndex, totalRecords);
 
+            // Step 5: 补偿检查——应对所有批次均早于本步骤消费完成的极端场景
+            syncTaskRecordService.checkAndMarkSuccessIfAllDone(domain, date);
+
         } catch (Exception e) {
             syncTaskRecordService.updateFailed(domain, date, e.getMessage());
             throw new RuntimeException(
