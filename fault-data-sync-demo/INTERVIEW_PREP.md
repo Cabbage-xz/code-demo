@@ -56,7 +56,238 @@ MQ 消费失败自动重试 3 次，超限进 DLQ，DLQ Consumer 将 sync_task_r
 
 ---
 
-## 二、面试问答
+## 二、系统架构与完整链路图
+
+---
+
+### 系统架构图
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                               外 部 基 础 设 施                                   │
+│                                                                                  │
+│  ┌─────────────────────────┐   ┌──────────────────────────┐  ┌────────────────┐ │
+│  │  PowerJob Server :7700  │   │  RocketMQ Broker :9876   │  │  MySQL :3306   │ │
+│  │                         │   │                          │  │  DB: code_demo │ │
+│  │  每域独立 cron 任务      │   │  Topic:                  │  │                │ │
+│  │  instanceParams:        │   │  fault-data-sync-topic   │  │  fault_record  │ │
+│  │  {                      │   │                          │  │  (UNIQUE idx:  │ │
+│  │    "domain": "xxx",     │   │  DLQ:                    │  │  domain+date   │ │
+│  │    "syncDays": 5        │   │  %DLQ%fault-data-sync-   │  │  +rank)        │ │
+│  │  }                      │   │  consumer                │  │                │ │
+│  │                         │   │                          │  │  sync_task_    │ │
+│  │  20 个任务对应 20 个域   │   │                          │  │  record        │ │
+│  └────────────┬────────────┘   └────────────┬─────────────┘  └───────┬────────┘ │
+└───────────────│────────────────────────────── │─────────────────────── │─────────┘
+                │ 任务下发                       │ 投递 / 消费             │ 读写
+                ▼                               │                        │
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                  fault-data-sync-demo  (Spring Boot App :8083)                   │
+│                                                                                  │
+│  ┌──────────────────────────────────────────────────────────────────────────┐   │
+│  │  Job 层                                                                  │   │
+│  │  FaultDataSyncJob  (PowerJob BasicProcessor)                             │   │
+│  │    parseDomain() · parseSyncDays() · buildSyncDates()                    │   │
+│  │    CompletableFuture × syncDays  →  syncExecutor                         │   │
+│  └─────────────────────────────────┬────────────────────────────────────────┘   │
+│                                    │ syncDomainDate(domain, date)                │
+│  ┌─────────────────────────────────▼────────────────────────────────────────┐   │
+│  │  Service 层                                                              │   │
+│  │  FaultSyncServiceImpl                                                    │   │
+│  │    RUNNING → DELETE → rank游标循环(pull + send) → MESSAGES_SENT          │   │
+│  │  SyncTaskRecordServiceImpl                                               │   │
+│  │    状态机：PENDING → RUNNING → MESSAGES_SENT → SUCCESS / FAILED          │   │
+│  └──────────────┬───────────────────────────────────────┬────────────────── ┘   │
+│                 │ pull(lastRank, 5000)                   │ syncSend(batch)       │
+│  ┌──────────────▼──────────────────────┐  ┌─────────────▼──────────────────┐   │
+│  │  Client 层                          │  │  MQ 生产层                     │   │
+│  │  FaultDataSourceClient (接口)        │  │  FaultDataProducer             │   │
+│  │  └─ MockFaultDataSourceClient        │  │  syncSend · retry=2            │   │
+│  │       生产替换为真实 HTTP 调用        │  │                                │   │
+│  └─────────────────────────────────────┘  └─────────────┬──────────────────┘   │
+│                                                          │ → RocketMQ            │
+│  ┌──────────────────────────────────────────────────────────────────────────┐   │
+│  │  Config 层   SyncThreadPoolConfig                                        │   │
+│  │  ThreadPoolExecutor(core=max=20, ArrayBlockingQueue(100), CallerRuns)    │   │
+│  │  双重作用：① 5个日期并发执行  ② 多域任务共享，充当全局并发限速器           │   │
+│  └──────────────────────────────────────────────────────────────────────────┘   │
+│                                            ↑ 从 RocketMQ 消费                    │
+│  ┌──────────────────────────────────────────────────────────────────────────┐   │
+│  │  MQ 消费层                                                               │   │
+│  │  FaultDataConsumer  (@RocketMQMessageListener, maxReconsumeTimes=3)      │   │
+│  │    CollUtil.split(1000) → batchInsert(INSERT IGNORE)                     │   │
+│  │    → incrementCompletedBatch → status = SUCCESS                          │   │
+│  │  FaultDataDlqConsumer  (订阅 %DLQ%fault-data-sync-consumer)              │   │
+│  │    → status = FAILED + 告警钩子（钉钉 / 邮件 / PagerDuty 可扩展）        │   │
+│  └─────────────────────────────────┬────────────────────────────────────────┘   │
+│                                    │ batchInsert / updateStatus                  │
+│  ┌─────────────────────────────────▼────────────────────────────────────────┐   │
+│  │  Persistence 层  (MyBatis-Plus)                                          │   │
+│  │  FaultRecordMapper      ·  resources/mapper/FaultRecordMapper.xml        │   │
+│  │  SyncTaskRecordMapper   ·  resources/mapper/SyncTaskRecordMapper.xml     │   │
+│  └──────────────────────────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 完整链路图
+
+#### 正常链路（Happy Path）
+
+```
+                       PowerJob Server（cron，每日触发）
+                                    │
+                  instanceParams: {"domain":"domain_a","syncDays":5}
+                                    │
+                                    ▼
+                  ┌─────────────────────────────────────────┐
+                  │         FaultDataSyncJob.process()       │
+                  │  parseDomain()    → "domain_a"           │
+                  │  buildSyncDates() → [D-1,D-2,D-3,D-4,D-5] │
+                  └─────────────────────┬───────────────────┘
+                                        │ 提交 5 个 CompletableFuture
+                    ┌───────────────────┼───────────────────┐
+                    │                   │                   │
+              CF: D-1              CF: D-2 ···         CF: D-5
+                    └───────────────────┼───────────────────┘
+                                        │ syncExecutor
+                                        │ （20线程有界线程池，与其他域共享）
+                                        ▼
+           ┌────────────────────────────────────────────────────────────┐
+           │   FaultSyncServiceImpl.syncDomainDate("domain_a", D-1)    │
+           │                                                            │
+           │  [1] sync_task_record  →  RUNNING                         │
+           │  [2] DELETE fault_record                                   │
+           │        WHERE domain='domain_a' AND data_date='D-1'        │
+           │        ↑ 全量覆盖：保证本次同步到最新数据                   │
+           │                                                            │
+           │  [3] rank 游标翻页拉取循环  (lastRank 初始值 = 0)          │
+           │  ┌──────────────────────────────────────────────────────┐  │
+           │  │  a. records = client.pull(domain, D-1, lastRank, 5000)│  │
+           │  │     → 返回 List<FaultRecordDTO>（rank > lastRank）    │  │
+           │  │                                                      │  │
+           │  │  b. FaultDataProducer.syncSend(                      │  │
+           │  │       FaultDataBatchMessage{domain, date,            │  │
+           │  │         batchSeq, records})                          │  │
+           │  │     → RocketMQ: fault-data-sync-topic                │  │
+           │  │       发送失败自动重试 2 次                           │  │
+           │  │                                                      │  │
+           │  │  c. lastRank = max(records[*].rank)                  │  │
+           │  │                                                      │  │
+           │  │  d. records.size() < 5000  →  EXIT（最后一批）       │  │
+           │  │     else  →  继续拉取下一批                          │  │
+           │  └──────────────────────────────────────────────────────┘  │
+           │     正常场景：2万条 / 4批；顶峰：100万条 / 200批            │
+           │                                                            │
+           │  [4] sync_task_record  →  MESSAGES_SENT(batchCount=N)     │
+           └────────────────────────────────────────────────────────────┘
+                                        │
+                    [5 个 CF 全部完成，汇总结果]
+                                        │
+                                        ▼
+                  PowerJob ProcessResult(true, "成功=5 失败=0 总计=5")
+                  → PowerJob 标记任务实例 SUCCESS
+
+
+═══════════════════ 异步消费链路（与拉取并行执行）═══════════════════
+
+                  RocketMQ: fault-data-sync-topic
+                                    │
+                         投递 FaultDataBatchMessage
+                                    │
+                                    ▼
+           ┌────────────────────────────────────────────────────────────┐
+           │          FaultDataConsumer.onMessage(msg)                  │
+           │                                                            │
+           │  [A] msg.records  →  List<FaultRecordEntity>              │
+           │                                                            │
+           │  [B] CollUtil.split(entities, 1000)                       │
+           │      → faultRecordMapper.batchInsert(subBatch)            │
+           │         INSERT IGNORE INTO fault_record VALUES (...)      │
+           │         唯一索引 (domain, data_date, rank) 防重复写入      │
+           │                                                            │
+           │  [C] syncTaskRecordService.incrementCompletedBatch(N)     │
+           │      UPDATE sync_task_record                               │
+           │      SET completed_batch_count = completed_batch_count + 1,│
+           │          status = CASE WHEN completed_batch_count+1 >= N  │
+           │                        THEN 'SUCCESS' ELSE status END     │
+           │      WHERE domain=? AND data_date=? AND status='MESSAGES_SENT' │
+           │      → completed_batch_count == N 时 → status = SUCCESS ✓ │
+           └────────────────────────────────────────────────────────────┘
+```
+
+#### 故障路径
+
+```
+═══════════════════ 故障路径 A：拉取阶段报错 ═══════════════════
+
+  例：共8批数据，前3批发送成功，第4批 client.pull() 抛异常
+
+  client.pull() 抛出异常
+          │
+          ▼
+  FaultSyncServiceImpl catch 块：
+    sync_task_record  →  FAILED（MESSAGES_SENT 未被设置，batchCount 未记录）
+    异常向上传播  →  CompletableFuture 返回 "FAIL:domain_a_D-1:连接超时"
+
+  已发出的前3批 MQ 消息：
+    Consumer 正常消费，INSERT IGNORE 写库 ✓
+    BUT: incrementCompletedBatch 的 WHERE status='MESSAGES_SENT' 不匹配
+         （当前状态为 FAILED）→  0行更新  →  任务永远不会变 SUCCESS
+
+  PowerJob 任务重试：
+    [1] DELETE fault_record（清掉前3批已入库数据）
+    [2] lastRank = 0，重新拉取全部8批
+    [3] 老的3条MQ消息若仍在队列被再次消费 → INSERT IGNORE 跳过或正常插入
+    [4] 8批全部消费成功 → SUCCESS ✓
+    ⚠ 当前设计无断点续传，每次重跑必须从头拉取
+
+
+═══════════════════ 故障路径 B：消费侧入库失败 ═══════════════════
+
+  例：前4批成功入库，第5批 batchInsert 抛异常（DB连接断）
+
+  pull 循环不感知消费侧结果：
+    第5批 MQ 发出后继续拉取 → 8批全部发出
+    sync_task_record  →  MESSAGES_SENT(8)
+
+  FaultDataConsumer 消费第5批 → batchInsert 抛异常
+          │
+          ▼
+  RocketMQ 指数退避重投（间隔：10s / 30s / 1min，最多3次）
+          │ 其余7批独立消费，不受影响，正常写库
+          │ 第5批3次仍失败
+          ▼
+  %DLQ%fault-data-sync-consumer
+          │
+          ▼
+  FaultDataDlqConsumer.onMessage()
+    sync_task_record  →  FAILED + 记录错误信息
+    触发告警钩子（钉钉 / 邮件 / PagerDuty 可扩展）
+
+  最终状态：fault_record 有7批数据（35000条），第5批5000条缺失
+
+  PowerJob 任务重跑：
+    [1] DELETE 清掉7批数据
+    [2] 重拉全部8批，发8条新 MQ 消息
+    [3] 8批全部消费成功，INSERT IGNORE 幂等保障 → SUCCESS ✓
+
+
+═══════════════════ 两种故障的恢复层级对比 ═══════════════════
+
+  ┌───────────────────────┬──────────────────────────────┬───────────────────┐
+  │  保障层               │  负责的故障类型               │  代价             │
+  ├───────────────────────┼──────────────────────────────┼───────────────────┤
+  │  MQ 自动重试（3次）   │  瞬时故障（DB抖动、连接闪断） │  低：仅重投单条   │
+  │  PowerJob 任务重跑    │  持久故障（宕机、Bug修复补跑） │  重拉全量数据     │
+  │  DELETE+INSERT IGNORE │  幂等兜底，任意次重跑正确     │  短暂空窗口可接受 │
+  └───────────────────────┴──────────────────────────────┴───────────────────┘
+```
+
+---
+
+## 三、面试问答
 
 ---
 
@@ -425,7 +656,7 @@ INSERT IGNORE 本身每条语句都是自动提交的，如果不加 `@Transacti
 
 ---
 
-## 三、面试官可能的追问 & 压力问题
+## 四、面试官可能的追问 & 压力问题
 
 ---
 
@@ -452,7 +683,7 @@ INSERT IGNORE 本身每条语句都是自动提交的，如果不加 `@Transacti
 
 ---
 
-## 四、一句话速记（面试前复习用）
+## 五、一句话速记（面试前复习用）
 
 | 知识点 | 一句话 |
 |--------|--------|
