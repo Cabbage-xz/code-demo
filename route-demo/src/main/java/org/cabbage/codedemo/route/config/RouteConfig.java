@@ -34,6 +34,12 @@ public class RouteConfig {
     private Boolean enabled;
 
     /**
+     * 对应的数据源 key，与 DynamicRoutingDataSource 中注册的 key 一致
+     * 例如：beta / comm，为空时不切换数据源
+     */
+    private String dataSource;
+
+    /**
      * 基础版本构造函数
      * @param module 模块
      * @param suffix 后缀

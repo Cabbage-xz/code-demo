@@ -2,10 +2,23 @@ spring:
   application:
     name: route-demo
   datasource:
+    # 默认数据源（单数据源模式下使用）
     driverClassName: com.mysql.cj.jdbc.Driver
     username: root
     password: 1234567a
     url: jdbc:mysql://127.0.0.1:3306/code_demo?useUnicode=true&characterEncoding=UTF-8&rewriteBatchedStatements=true&allowMultiQueries=true&serverTimezone=Asia/Shanghai
+    # 多数据源扩展：beta 环境数据源
+    beta:
+      driver-class-name: com.mysql.cj.jdbc.Driver
+      jdbc-url: jdbc:mysql://127.0.0.1:3306/code_demo_beta?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai
+      username: root
+      password: 1234567a
+    # 多数据源扩展：comm 环境数据源
+    comm:
+      driver-class-name: com.mysql.cj.jdbc.Driver
+      jdbc-url: jdbc:mysql://127.0.0.1:3306/code_demo_comm?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai
+      username: root
+      password: 1234567a
 
 
 route:
@@ -17,13 +30,14 @@ route:
       suffix: /betaSuffix
       description: Beta-env
       enabled: true
-
+      dataSource: beta
 
     comm_fault:
       module: faultDetail
       suffix: /commSuffix
       description: Comm-env
       enabled: true
+      dataSource: comm
 
     beta_other_app:
       module: otherAppFaultDetail

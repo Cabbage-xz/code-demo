@@ -21,13 +21,15 @@ import java.util.stream.Collectors;
 /**
  * PowerJob 故障数据同步任务处理器
  * <p>
- * 每日由 PowerJob Server 触发，并行同步 20 个领域 × 5 天数据。
+ * 每个领域在 PowerJob 中配置独立的定时任务，均指向本处理器。
+ * 每次触发只处理一个领域的 syncDays 天数据（D-1 至 D-syncDays）。
  * <p>
  * instanceParams 示例（JSON 字符串）：
  * <pre>
- * {"domains": ["domain_a", "domain_b", ...], "syncDays": 5}
+ * {"domain": "domain_a", "syncDays": 5}
  * </pre>
- * 若未传入，则使用配置文件中的默认值。
+ * 领域级并行由 PowerJob 并发调度多个任务实例实现；
+ * 日期级并行（5 个日期）通过 CompletableFuture + 共享有界线程池实现。
  */
 @Slf4j
 @Component
@@ -39,9 +41,6 @@ public class FaultDataSyncJob implements BasicProcessor {
     @Qualifier("syncExecutor")
     private final Executor syncExecutor;
 
-    @Value("${fault-sync.domains:}")
-    private List<String> defaultDomains;
-
     @Value("${fault-sync.sync-days:5}")
     private int defaultSyncDays;
 
@@ -50,36 +49,31 @@ public class FaultDataSyncJob implements BasicProcessor {
         log.info("[SyncJob] 任务触发，instanceId={} params={}",
                 context.getInstanceId(), context.getJobParams());
 
-        // 解析领域列表和同步天数（优先使用 instanceParams，否则使用配置默认值）
-        List<String> domains = parseDomains(context.getJobParams());
+        String domain = parseDomain(context.getJobParams());
         int syncDays = parseSyncDays(context.getJobParams());
         List<LocalDate> dates = buildSyncDates(syncDays);
 
-        log.info("[SyncJob] 领域数={} 同步天数={} 总任务数={}", domains.size(), syncDays,
-                domains.size() * dates.size());
+        log.info("[SyncJob] 领域={} 同步天数={} 总任务数={}", domain, syncDays, dates.size());
 
-        // 提交所有 domain+date 组合到有界线程池并行执行
+        // 对单个领域的所有日期并发提交到共享有界线程池
         List<CompletableFuture<String>> futures = new ArrayList<>();
-        for (String domain : domains) {
-            for (LocalDate date : dates) {
-                final String d = domain;
-                final LocalDate dt = date;
-                futures.add(CompletableFuture.supplyAsync(
-                        () -> {
-                            try {
-                                faultSyncService.syncDomainDate(d, dt);
-                                return "OK:" + d + "_" + dt;
-                            } catch (Exception e) {
-                                log.error("[SyncJob] 任务失败 domain={} date={}", d, dt, e);
-                                return "FAIL:" + d + "_" + dt + ":" + e.getMessage();
-                            }
-                        },
-                        syncExecutor
-                ));
-            }
+        for (LocalDate date : dates) {
+            final LocalDate dt = date;
+            futures.add(CompletableFuture.supplyAsync(
+                    () -> {
+                        try {
+                            faultSyncService.syncDomainDate(domain, dt);
+                            return "OK:" + domain + "_" + dt;
+                        } catch (Exception e) {
+                            log.error("[SyncJob] 任务失败 domain={} date={}", domain, dt, e);
+                            return "FAIL:" + domain + "_" + dt + ":" + e.getMessage();
+                        }
+                    },
+                    syncExecutor
+            ));
         }
 
-        // 等待所有任务完成，统计结果
+        // 等待所有日期任务完成，统计结果
         List<String> results = futures.stream()
                 .map(f -> {
                     try {
@@ -105,21 +99,24 @@ public class FaultDataSyncJob implements BasicProcessor {
         return new ProcessResult(true, summary);
     }
 
-    private List<String> parseDomains(String jobParams) {
+    /**
+     * 从 jobParams 中解析单个领域名称，若未提供则抛出异常。
+     */
+    private String parseDomain(String jobParams) {
         if (jobParams != null && !jobParams.isBlank()) {
             try {
                 cn.hutool.json.JSONObject json = JSONUtil.parseObj(jobParams);
-                if (json.containsKey("domains")) {
-                    return json.getJSONArray("domains").toList(String.class);
+                if (json.containsKey("domain")) {
+                    String domain = json.getStr("domain");
+                    if (domain != null && !domain.isBlank()) {
+                        return domain;
+                    }
                 }
             } catch (Exception e) {
-                log.warn("[SyncJob] 解析 jobParams 失败，使用默认领域列表: {}", e.getMessage());
+                log.warn("[SyncJob] 解析 jobParams 失败: {}", e.getMessage());
             }
         }
-        if (defaultDomains == null || defaultDomains.isEmpty()) {
-            throw new IllegalStateException("未配置领域列表，请检查 fault-sync.domains 配置或 jobParams");
-        }
-        return defaultDomains;
+        throw new IllegalStateException("jobParams 中未找到有效的 domain，请检查 PowerJob 任务配置");
     }
 
     private int parseSyncDays(String jobParams) {
@@ -136,7 +133,7 @@ public class FaultDataSyncJob implements BasicProcessor {
     }
 
     /**
-     * 生成 D-1 至 D-syncDays 的日期列表（含边历史重同步）
+     * 生成 D-1 至 D-syncDays 的日期列表（含历史重同步）
      */
     private List<LocalDate> buildSyncDates(int syncDays) {
         List<LocalDate> dates = new ArrayList<>(syncDays);

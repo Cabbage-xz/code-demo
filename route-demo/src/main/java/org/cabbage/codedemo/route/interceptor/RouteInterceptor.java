@@ -7,6 +7,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
 import org.cabbage.codedemo.route.config.RouteConfig;
+import org.cabbage.codedemo.route.context.DataSourceContext;
 import org.cabbage.codedemo.route.context.RouteContext;
 import org.cabbage.codedemo.route.manager.RouteConfigManager;
 import org.springframework.stereotype.Component;
@@ -39,6 +40,10 @@ public class RouteInterceptor implements HandlerInterceptor {
 
             RouteConfig config = routeConfigManager.getRouteConfig(routeKey);
             RouteContext.setRouteInfo(routeKey, config.getSuffix(), config.getModule());
+            if (config.getDataSource() != null) {
+                DataSourceContext.set(config.getDataSource());
+                log.info("数据源已切换：{}", config.getDataSource());
+            }
             log.info("路由信息已设置");
             return true;
         } catch (Exception e) {
@@ -86,5 +91,6 @@ public class RouteInterceptor implements HandlerInterceptor {
     public void afterCompletion(HttpServletRequest req, HttpServletResponse resp, Object handler, Exception ex) {
         log.debug("路由拦截器，清理上下文");
         RouteContext.clear();
+        DataSourceContext.clear();
     }
 }

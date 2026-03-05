@@ -37,28 +37,6 @@ powerjob:
 
 # 故障数据同步任务配置
 fault-sync:
-  # 领域列表（20 个领域，PowerJob instanceParams 可覆盖）
-  domains:
-    - domain_a
-    - domain_b
-    - domain_c
-    - domain_d
-    - domain_e
-    - domain_f
-    - domain_g
-    - domain_h
-    - domain_i
-    - domain_j
-    - domain_k
-    - domain_l
-    - domain_m
-    - domain_n
-    - domain_o
-    - domain_p
-    - domain_q
-    - domain_r
-    - domain_s
-    - domain_t
   # 向前同步天数（D-1 至 D-N，覆盖历史延迟更新）
   sync-days: 5
   # 并行线程池大小（建议等于领域数）
