@@ -149,6 +149,52 @@ CREATE TABLE sync_task_record (
 ) ENGINE=InnoDB;
 ```
 
+### sync_task_record State Machine
+
+```
+                       Task triggered
+                            │
+                            ▼
+                       ┌─────────┐
+                       │ PENDING │  Record upserted at syncDomainDate() entry
+                       └────┬────┘
+                            │  DELETE executed, pull loop starts
+                            ▼
+                       ┌─────────┐
+                       │ RUNNING │  DELETE done; rank-cursor loop in progress
+                       └────┬────┘
+               ┌────────────┴─────────────┐
+       All batches pulled            pull() or sendBatch()
+       & sent successfully           throws exception
+               │                          │
+               ▼                          ▼
+      ┌──────────────┐              ┌────────┐
+      │ MESSAGES_SENT│              │ FAILED │ ←── DLQ Consumer also
+      │ batchCount=N │              │        │     writes FAILED directly
+      └──────┬───────┘              └────────┘
+             │  Consumer calls incrementCompletedBatch per batch:
+             │  WHERE status='MESSAGES_SENT' (guard: FAILED tasks ignored)
+             │
+             ├── completed < N  →  stay MESSAGES_SENT
+             │
+             └── completed == N
+                          │
+                          ▼
+                     ┌─────────┐
+                     │ SUCCESS │  All batches consumed and persisted
+                     └─────────┘
+```
+
+| Status | Meaning | Set by |
+|--------|---------|--------|
+| PENDING | Record initialised, awaiting execution | `syncDomainDate()` entry upsert |
+| RUNNING | Producer loop executing (data window is empty during this phase) | After DELETE completes |
+| MESSAGES_SENT | All MQ messages sent; `batchCount` recorded; awaiting consumer | End of pull loop |
+| SUCCESS | All batches consumed and written to DB | `incrementCompletedBatch` atomic UPDATE |
+| FAILED | Producer exception **or** DLQ consumer triggered | Exception catch / `FaultDataDlqConsumer` |
+
+**Key guard**: `incrementCompletedBatch` uses `WHERE status = 'MESSAGES_SENT'`, so once a task is FAILED the consumer's progress updates become no-ops — preventing a partially-consumed failed task from accidentally flipping to SUCCESS.
+
 ---
 
 ## Key Design Decisions
@@ -200,6 +246,35 @@ WHERE domain = #{domain} AND data_date = #{dataDate} AND status = 'MESSAGES_SENT
 | Partial DB insert failure | MQ retries the entire batch; `INSERT IGNORE` skips already-inserted rows |
 | Upstream API timeout/error | Exception propagates → task marked `FAILED`; PowerJob task-level retry |
 | DLQ (exceeded max retries) | `FaultDataDlqConsumer` marks `FAILED`; extendable to alerting |
+
+---
+
+## Failure Scenarios
+
+### Pull-phase failure (e.g. batch 4 of 8 throws exception)
+
+1. Batches 1–3 are already in RocketMQ; consumers will INSERT IGNORE them into DB
+2. Exception caught in `syncDomainDate()` → `sync_task_record` → **FAILED**; `MESSAGES_SENT` is never set
+3. `incrementCompletedBatch` has `WHERE status = 'MESSAGES_SENT'` — since status is FAILED, all consumer updates are no-ops; task never reaches SUCCESS
+4. PowerJob task retry: DELETE all data for this domain+date → re-pull from `lastRank = 0`
+5. **No checkpoint resume**: the current design always restarts from the beginning; previously consumed batches 1–3 are deleted and re-pulled
+
+### Consume-phase failure (e.g. batch 5 INSERT throws exception)
+
+1. Pull loop is unaware of consumer results; all 8 batches are sent → `sync_task_record` → **MESSAGES_SENT(8)**
+2. Consumer fails for batch 5 → RocketMQ exponential back-off retry (×3); other batches consume independently
+3. After 3 retries: batch 5 routed to DLQ (`%DLQ%fault-data-sync-consumer`)
+4. `FaultDataDlqConsumer` → `sync_task_record` → **FAILED** + alert hook
+5. Final state: 7 batches in DB (35 000 rows), batch 5 missing; status = FAILED
+6. PowerJob task retry: DELETE + full re-pull + full re-consume → SUCCESS
+
+### Recovery layer summary
+
+| Layer | Handles | Cost |
+|-------|---------|------|
+| MQ auto-retry (×3) | Transient faults (DB blip, brief connection loss) | Low — single message only |
+| PowerJob task retry | Persistent faults (DB down, bug-fix re-run) | Full re-pull required |
+| DELETE + INSERT IGNORE | Idempotency guarantee for any number of re-runs | Brief empty window (acceptable) |
 
 ---
 

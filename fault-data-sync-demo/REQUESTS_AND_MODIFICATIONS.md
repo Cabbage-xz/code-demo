@@ -98,24 +98,6 @@ Use this template for each new entry:
 
 ---
 
-### Request 4: 面试文档新增故障场景问答
-- **Date**: 2026-03-05
-- **Request Details**: 新增两个关于系统故障场景的面试问答：
-  1. 拉取阶段中途失败（如第4批拉取报错），系统行为和下次重跑是否会断点续拉
-  2. MQ 消费侧入库失败（第5批发送成功但 Consumer 写库异常），系统行为和解决方案
-- **Modification Made**:
-  - `INTERVIEW_PREP.md` 在 Q7（DLQ）之后新增两道 Q，覆盖：
-    - 拉取失败场景：sync_task_record 停留 FAILED、incrementCompletedBatch 无法推进、重跑时 DELETE 清理 + 从头重拉、无断点续传的局限及可能的优化方向
-    - 消费入库失败场景：pull 循环不感知消费侧结果、MQ 重试3次→DLQ→FAILED、PowerJob 重跑托底、最终一致性保障
-    - 两种场景的对比总结表（MQ重试/PowerJob重跑/DELETE幂等各自负责的故障层级）
-  - `REQUESTS_AND_MODIFICATIONS.md` 新增本条 Request 4
-- **Files Modified**:
-  - `fault-data-sync-demo/INTERVIEW_PREP.md`
-  - `fault-data-sync-demo/REQUESTS_AND_MODIFICATIONS.md`
-- **Status**: Completed
-
----
-
 ### Request 3: 架构修正（单域处理器）+ 面试文档增补
 - **Date**: 2026-03-05
 - **Request Details**: 发现现有代码设计（单任务 + `jobParams` 传入所有域列表）与实际业务模型冲突。实际业务中每个领域在 PowerJob 中配置独立定时任务，处理器只负责单域5天同步。需同步修正代码、配置和文档。
@@ -139,6 +121,81 @@ Use this template for each new entry:
   - `fault-data-sync-demo/src/main/java/org/cabbage/codedemo/faultdatasync/job/FaultDataSyncJob.java`
   - `fault-data-sync-demo/src/main/resources/application.yml`
   - `fault-data-sync-demo/INTERVIEW_PREP.md`
+  - `fault-data-sync-demo/MODULE_DOCS.md`
+  - `fault-data-sync-demo/REQUESTS_AND_MODIFICATIONS.md`
+- **Status**: Completed
+
+---
+
+### Request 4: 面试文档新增故障场景问答
+- **Date**: 2026-03-05
+- **Request Details**: 新增两个关于系统故障场景的面试问答：
+  1. 拉取阶段中途失败（如第4批拉取报错），系统行为和下次重跑是否会断点续拉
+  2. MQ 消费侧入库失败（第5批发送成功但 Consumer 写库异常），系统行为和解决方案
+- **Modification Made**:
+  - `INTERVIEW_PREP.md` 在 Q7（DLQ）之后新增两道 Q，覆盖：
+    - 拉取失败场景：sync_task_record 停留 FAILED、incrementCompletedBatch 无法推进、重跑时 DELETE 清理 + 从头重拉、无断点续传的局限
+    - 消费入库失败场景：pull 循环不感知消费侧结果、MQ 重试3次→DLQ→FAILED、PowerJob 重跑托底
+    - 两种场景的对比总结表（MQ重试/PowerJob重跑/DELETE幂等各自负责的故障层级）
+- **Files Modified**:
+  - `fault-data-sync-demo/INTERVIEW_PREP.md`
+  - `fault-data-sync-demo/REQUESTS_AND_MODIFICATIONS.md`
+- **Status**: Completed
+
+---
+
+### Request 5: 面试文档新增系统架构图与完整链路图
+- **Date**: 2026-03-05
+- **Request Details**: 在面试文档中新增系统架构图（静态视图）和完整链路图（动态时序），原 Section 二/三/四 重新编号为三/四/五。
+- **Modification Made**:
+  - `INTERVIEW_PREP.md` 新增 Section 二，包含：
+    - 系统架构图：外部基础设施（PowerJob/RocketMQ/MySQL）与应用内六层的依赖关系和数据流向
+    - 完整链路图（正常链路）：PowerJob触发 → CompletableFuture并发 → rank游标循环 → MQ发送 → 异步消费 → incrementCompletedBatch → SUCCESS 完整时序
+    - 完整链路图（故障路径A/B）：拉取报错和消费入库失败的完整流转，含三层保障对比表
+- **Files Modified**:
+  - `fault-data-sync-demo/INTERVIEW_PREP.md`
+- **Status**: Completed
+
+---
+
+### Request 6: 面试文档新增完整口述介绍版和状态机详解
+- **Date**: 2026-03-05
+- **Request Details**: 在面试文档中新增两项内容：一段面向技术面试官的完整口述版项目介绍（2-3分钟），以及 sync_task_record 状态机的详细说明。
+- **Modification Made**:
+  - `INTERVIEW_PREP.md` Section 一新增「完整口述版（2-3分钟）」：覆盖业务背景、技术选型、四项核心设计决策、量化结果；原分点版保留并标记为「精简要点版」
+  - `INTERVIEW_PREP.md` Section 二末尾新增「sync_task_record 状态机详解」：ASCII 状态转换图、各状态含义与设计意图对照表、incrementCompletedBatch SQL 三条设计原则、故障场景与状态对应关系表
+- **Files Modified**:
+  - `fault-data-sync-demo/INTERVIEW_PREP.md`
+- **Status**: Completed
+
+---
+
+### Request 7: 面试文档新增批次级失败补跑方案追问
+- **Date**: 2026-03-05
+- **Request Details**: 追问场景：若某一批次拉取失败或入库失败，在保证其他批次已入库数据不被删除的情况下，该如何设计补跑方案？
+- **Modification Made**:
+  - `INTERVIEW_PREP.md` 在故障场景问答之后新增追问 Q&A，涵盖三处改造：
+    1. Consumer 侧：全局 DELETE+INSERT IGNORE → 批次级 DELETE+INSERT（从 MQ 消息取 minRank/maxRank，@Transactional 保原子性）
+    2. sync_task_record 增加 `last_successful_rank` 字段，pull 循环每批持久化进度，重跑时从断点继续，不执行全局 DELETE
+    3. DLQ 路径：改为记录失败批次到 `sync_batch_record` 补偿表，修复任务扫表后按 rank 范围重拉+重发 MQ
+  - 附改造前后对比表及关键权衡说明（上游 append-only 时安全，否则需全量修复兜底）
+- **Files Modified**:
+  - `fault-data-sync-demo/INTERVIEW_PREP.md`
+- **Status**: Completed
+
+---
+
+### Request 8: MODULE_DOCS 和 REQUESTS_AND_MODIFICATIONS 同步至最新
+- **Date**: 2026-03-05
+- **Request Details**: 检查并更新 MODULE_DOCS.md 和 REQUESTS_AND_MODIFICATIONS.md，使其与当前最新状态一致。
+- **Modification Made**:
+  - `MODULE_DOCS.md`：
+    - 在 sync_task_record 表设计之后新增状态机图（ASCII 转换图 + 各状态说明表 + key guard 说明）
+    - 新增 "Failure Scenarios" 章节，覆盖拉取阶段失败、消费阶段失败两种场景的具体行为，以及三层恢复保障对比表
+  - `REQUESTS_AND_MODIFICATIONS.md`：
+    - 修正 Request 3/4 顺序（原文件中 4 出现在 3 之前）
+    - 补录 Request 5（架构图/链路图）、Request 6（完整口述版+状态机）、Request 7（批次级补跑方案）、本条 Request 8
+- **Files Modified**:
   - `fault-data-sync-demo/MODULE_DOCS.md`
   - `fault-data-sync-demo/REQUESTS_AND_MODIFICATIONS.md`
 - **Status**: Completed
