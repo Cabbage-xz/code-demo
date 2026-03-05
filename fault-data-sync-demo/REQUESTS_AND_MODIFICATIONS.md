@@ -98,6 +98,24 @@ Use this template for each new entry:
 
 ---
 
+### Request 4: 面试文档新增故障场景问答
+- **Date**: 2026-03-05
+- **Request Details**: 新增两个关于系统故障场景的面试问答：
+  1. 拉取阶段中途失败（如第4批拉取报错），系统行为和下次重跑是否会断点续拉
+  2. MQ 消费侧入库失败（第5批发送成功但 Consumer 写库异常），系统行为和解决方案
+- **Modification Made**:
+  - `INTERVIEW_PREP.md` 在 Q7（DLQ）之后新增两道 Q，覆盖：
+    - 拉取失败场景：sync_task_record 停留 FAILED、incrementCompletedBatch 无法推进、重跑时 DELETE 清理 + 从头重拉、无断点续传的局限及可能的优化方向
+    - 消费入库失败场景：pull 循环不感知消费侧结果、MQ 重试3次→DLQ→FAILED、PowerJob 重跑托底、最终一致性保障
+    - 两种场景的对比总结表（MQ重试/PowerJob重跑/DELETE幂等各自负责的故障层级）
+  - `REQUESTS_AND_MODIFICATIONS.md` 新增本条 Request 4
+- **Files Modified**:
+  - `fault-data-sync-demo/INTERVIEW_PREP.md`
+  - `fault-data-sync-demo/REQUESTS_AND_MODIFICATIONS.md`
+- **Status**: Completed
+
+---
+
 ### Request 3: 架构修正（单域处理器）+ 面试文档增补
 - **Date**: 2026-03-05
 - **Request Details**: 发现现有代码设计（单任务 + `jobParams` 传入所有域列表）与实际业务模型冲突。实际业务中每个领域在 PowerJob 中配置独立定时任务，处理器只负责单域5天同步。需同步修正代码、配置和文档。
