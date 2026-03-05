@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="org.cabbage.codedemo.route.mapper.FaultDetailMapper">
+
+    <!--
+        SQL 中引用 fault_detail，DynamicTableNameInnerInterceptor 在执行前
+        将其替换为 DimensionContext 中当前请求对应的真实表名
+        例如：FROM fault_detail → FROM beta_normal_fault
+    -->
+
+    <select id="queryFaultDistribution" resultType="java.lang.String">
+        SELECT CONCAT(table_name, '-queryFaultDistribution') AS result
+        FROM information_schema.TABLES
+        WHERE table_schema = DATABASE()
+          AND table_name = 'fault_detail'
+        LIMIT 1
+    </select>
+
+    <select id="queryFaultDetail" resultType="java.lang.String">
+        SELECT CONCAT(table_name, '-queryFaultDetail') AS result
+        FROM information_schema.TABLES
+        WHERE table_schema = DATABASE()
+          AND table_name = 'fault_detail'
+        LIMIT 1
+    </select>
+
+    <select id="countFaults" resultType="java.lang.String">
+        SELECT CONCAT(table_name, '-countFaults') AS result
+        FROM information_schema.TABLES
+        WHERE table_schema = DATABASE()
+          AND table_name = 'fault_detail'
+        LIMIT 1
+    </select>
+
+</mapper>

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="org.cabbage.codedemo.route.mapper.ext.CommNormalExtMapper">
+
+    <!-- Comm普通故障 独有查询：故障趋势 -->
+    <select id="queryNormalFaultTrend" resultType="java.lang.String">
+        SELECT CONCAT(table_name, '-queryNormalFaultTrend') AS result
+        FROM information_schema.TABLES
+        WHERE table_schema = DATABASE()
+          AND table_name = 'fault_detail'
+        LIMIT 1
+    </select>
+
+</mapper>

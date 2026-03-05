@@ -2,57 +2,49 @@ spring:
   application:
     name: route-demo
   datasource:
-    # 默认数据源（单数据源模式下使用）
-    driverClassName: com.mysql.cj.jdbc.Driver
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://127.0.0.1:3306/code_demo?useUnicode=true&characterEncoding=UTF-8&rewriteBatchedStatements=true&allowMultiQueries=true&serverTimezone=Asia/Shanghai
     username: root
     password: 1234567a
-    url: jdbc:mysql://127.0.0.1:3306/code_demo?useUnicode=true&characterEncoding=UTF-8&rewriteBatchedStatements=true&allowMultiQueries=true&serverTimezone=Asia/Shanghai
-    # 多数据源扩展：beta 环境数据源
-    beta:
-      driver-class-name: com.mysql.cj.jdbc.Driver
-      jdbc-url: jdbc:mysql://127.0.0.1:3306/code_demo_beta?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai
-      username: root
-      password: 1234567a
-    # 多数据源扩展：comm 环境数据源
-    comm:
-      driver-class-name: com.mysql.cj.jdbc.Driver
-      jdbc-url: jdbc:mysql://127.0.0.1:3306/code_demo_comm?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai
-      username: root
-      password: 1234567a
+    # 二期分库时启用以下两个数据源，并激活 DynamicDataSourceConfig
+    # beta:
+    #   driver-class-name: com.mysql.cj.jdbc.Driver
+    #   jdbc-url: jdbc:mysql://127.0.0.1:3306/code_demo_beta?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai
+    #   username: root
+    #   password: 1234567a
+    # comm:
+    #   driver-class-name: com.mysql.cj.jdbc.Driver
+    #   jdbc-url: jdbc:mysql://127.0.0.1:3306/code_demo_comm?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai
+    #   username: root
+    #   password: 1234567a
 
+mybatis-plus:
+  mapper-locations: classpath:mapper/**/*.xml
 
-route:
-  default-key: default
-  strict-mode: false
+# -------------------------------------------------------
+# 维度路由配置
+# dimensionKey = {module}_{domain}，由拦截器从 URL /{module}/{domain}/... 自动提取
+# tableName    = 对应的物理表名
+# dataSource   = 二期分库时填写（beta / comm），一期留空
+# -------------------------------------------------------
+dimension:
+  default-key: beta_normal
   mappings:
-    beta_fault:
-      module: faultDetail
-      suffix: /betaSuffix
-      description: Beta-env
-      enabled: true
-      dataSource: beta
-
-    comm_fault:
-      module: faultDetail
-      suffix: /commSuffix
-      description: Comm-env
-      enabled: true
-      dataSource: comm
-
-    beta_other_app:
-      module: otherAppFaultDetail
-      suffix: /betaSuffix
-      description: Beta-other-app
-      enabled: true
-
-    comm_other_app:
-      module: otherAppFaultDetail
-      suffix: /commSuffix
-      description: Comm-other-app
-      enabled: true
-
-    default:
-      module: faultDetail
-      suffix: /betaSuffix
-      description: default
-      enabled: true
+    beta_normal:
+      tableName: beta_normal_fault
+      description: Beta普通故障
+    beta_perf:
+      tableName: beta_perf_fault
+      description: Beta性能故障
+    beta_third:
+      tableName: beta_third_fault
+      description: Beta三方故障
+    comm_normal:
+      tableName: comm_normal_fault
+      description: Comm普通故障
+    comm_perf:
+      tableName: comm_perf_fault
+      description: Comm性能故障
+    comm_third:
+      tableName: comm_third_fault
+      description: Comm三方故障
