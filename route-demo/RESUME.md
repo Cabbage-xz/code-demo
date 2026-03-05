@@ -4,228 +4,229 @@
 
 ## 第一章：项目概述
 
-**项目名称**：基于注解驱动的动态路由框架（route-demo）
+**项目名称**：基于动态表名路由的多维度故障数据查询平台（route-demo）
 
-**技术栈**：Spring Boot 3.5.6 / MyBatis-Plus 3.5.6 / Hutool / Lombok / Java 17
+**技术栈**：Spring Boot 3.5.6 / MyBatis-Plus 3.5.6（DynamicTableNameInnerInterceptor）/ Hutool / Lombok / Java 17
 
 ### 问题背景
 
-在多环境故障数据查询场景下，系统需要根据请求来源（beta 环境、comm 环境）动态路由到不同的 Mapper 和 Service 实现。最初的做法是在业务方法中通过 `if-else` 判断路由标识，再手动调用对应实现，导致以下问题：
+故障数据查询平台存在两个模块（beta / comm）和三个领域（普通故障 / 性能故障 / 三方故障），交叉形成六个展示维度，每个维度对应一张独立的数据库表（`beta_normal_fault`、`beta_perf_fault`、`beta_third_fault`、`comm_normal_fault`、`comm_perf_fault`、`comm_third_fault`），六张表结构完全一致，仅表名不同，且数据全部在同一个库中。
 
-1. **耦合严重**：Controller/Service 层混杂路由判断逻辑，每次新增环境都要改多处代码
-2. **扩展性差**：新增 gamma、stress 等环境时，需要在所有业务方法里加分支
-3. **代码重复**：不同环境的 Service 实现高度相似，模板代码泛滥
-4. **可测试性差**：路由逻辑嵌在业务中，无法单独测试
+**原始代码状态**：六套从 Controller → Service → ServiceImpl → Mapper 完全重复的代码，除各自 1-2 个独有展示方法外，其余代码一字不差，仅 XML 中表名不同。
 
 ### 解决的核心痛点
 
-将路由判断从业务代码中彻底剥离，通过 **注解 + 工厂 + 拦截器** 三层机制，让业务代码对路由细节完全无感知，新增一个环境只需新增一个 `ServiceImpl` 类并打上 `@RouteCustom` 注解，零改动现有代码。
+| 痛点 | 表现 |
+|------|------|
+| 代码爆炸 | 6 套 Mapper + 6 套 ServiceImpl + 6 套 Controller，公共逻辑重复 6 遍 |
+| 扩展成本高 | 新增一个领域需要复制粘贴全套代码并逐一改表名 |
+| 维护困难 | 修改一个公共逻辑需要同步改 6 处，极易遗漏 |
+| 根本问题认知错误 | 六套表结构相同，差异只是表名，根本不需要六套 Bean |
+
+**重构后**：1 套 Mapper + 1 套 Service + 1 套 Controller 处理全部六个维度，各维度独有方法由薄扩展层独立维护，新增维度只需在 `application.yml` 加一行配置并新建对应的扩展文件。
 
 ---
 
 ## 第二章：架构设计与优化历程
 
-### 2.1 初版设计（if-else 硬编码方案）
+### 2.1 初版设计（if-else 硬编码）
 
 ```java
-// 初版：路由逻辑与业务完全耦合
-public String queryFaultDistribution(String env) {
-    if ("beta".equals(env)) {
-        return betaFaultDetailMapper.queryFaultDistribution();
-    } else if ("comm".equals(env)) {
-        return commFaultDetailMapper.queryFaultDistribution();
+// 初版：路由逻辑与业务完全耦合，6 个分支
+public String queryFaultDistribution(String dimension) {
+    if ("beta_normal".equals(dimension)) {
+        return betaNormalFaultMapper.queryFaultDistribution();
+    } else if ("beta_perf".equals(dimension)) {
+        return betaPerfFaultMapper.queryFaultDistribution();
     }
-    throw new IllegalArgumentException("unknown env: " + env);
+    // ... 另外 4 个分支
 }
 ```
 
-**问题**：每个业务方法都要写一遍 if-else；新增环境需全局搜索修改；单元测试要覆盖所有分支。
+**问题**：每个业务方法都要写一遍 if-else；新增维度需全局搜索修改；6 套 Mapper 各持一份相同的 SQL。
 
-### 2.2 优化思路
+### 2.2 错误的中间状态（Bean 路由方案）
 
-核心思想：**关注点分离（Separation of Concerns）**
+意识到 if-else 的问题后，曾考虑通过注解 + 工厂路由到不同 Bean（`BeanRouteFactory`），但这只是把重复从 if-else 搬到了 Bean 注册表，六套 ServiceImpl 和 Mapper 依然存在，代码量没有实质减少。
+
+**认知转变**：六张表结构完全一致，差异仅是表名，根本不需要六套 Bean。正确的抽象层次是"表名可变的单套代码"，而不是"多套代码的统一分发"。
+
+### 2.3 最终方案（动态表名路由）
+
+核心机制：**MyBatis-Plus `DynamicTableNameInnerInterceptor`**。Mapper XML 中统一写占位表名 `fault_detail`，插件在 SQL 执行前从 ThreadLocal 中读取当前请求的真实表名并替换，六张表共用一套 Mapper。
+
+**关注点分离**：
 
 | 职责 | 由谁承担 |
 |------|---------|
-| 路由规则解析 | `RouteInterceptor` 拦截器 |
-| 路由上下文存储 | `RouteContext`（ThreadLocal）|
-| Bean 实例查找 | `BeanRouteFactory` 工厂 |
-| 路由配置管理 | `RouteConfigManager` + `application.yml` |
-| 业务实现分发 | 各 `ServiceImpl`（打 `@RouteCustom` 注解）|
-| 统一入口 | `FaultDetailFacadeService` 外观服务 |
+| 维度识别（URL → dimensionKey） | `DimensionInterceptor` 拦截器 |
+| 维度上下文存储 | `DimensionContext`（ThreadLocal）|
+| 维度配置管理 | `DimensionManager` + `application.yml` |
+| 表名动态替换 | `DynamicTableNameInnerInterceptor`（MyBatis-Plus 插件）|
+| 公共业务逻辑 | `FaultDetailService`（单例，处理全部六个维度）|
+| 维度独有逻辑 | 各 `XxxExtService` + `XxxExtMapper`（薄扩展，仅含独有方法）|
 
-### 2.3 核心组件职责图（请求链路）
+### 2.4 完整请求链路
 
 ```
-HTTP 请求
-    │
-    ▼
-RouteInterceptor.preHandle()
-    │  1. 从 URL 路径提取 routeKey（如 beta_fault）
-    │  2. 查询 RouteConfigManager 得到 RouteConfig{module, suffix, dataSource}
-    │  3. 写入 RouteContext（ThreadLocal）
-    │  4. 写入 DataSourceContext（ThreadLocal）—— 多数据源扩展
-    │
-    ▼
-FaultController（所有环境共用同一个 Controller 方法）
-    │
-    ▼
-FaultDetailFacadeService.queryFaultDetail()
-    │  调用 BeanRouteFactory.getServiceFromContext()
-    │
-    ▼
-BeanRouteFactory
-    │  从 RouteContext 取 module + suffix
-    │  在 serviceRouteMap[module][suffix] 查找对应 Bean
-    │
-    ▼
-BetaFaultDetailServiceImpl / CommFaultDetailServiceImpl（真正执行业务）
-    │
-    ▼
-RouteInterceptor.afterCompletion()
-    └── RouteContext.clear() + DataSourceContext.clear()
+GET /beta/perf/distribution
+        │
+        ▼
+DimensionInterceptor.preHandle()
+  URI 路径段: ["beta", "perf", "distribution"]
+  拼接:       "beta_perf"
+  查配置:     DimensionManager → tableName = "beta_perf_fault"
+  写入:       DimensionContext.set("beta_perf", "beta_perf_fault")
+        │
+        ▼
+FaultCommonController.queryFaultDistribution()
+  → FaultDetailService.queryFaultDistribution()
+    → FaultDetailMapper.queryFaultDistribution()
+      → DynamicTableNameInnerInterceptor:
+          SQL 中 "fault_detail" → "beta_perf_fault"
+      → SELECT ... FROM beta_perf_fault（实际执行）
+        │
+        ▼
+DimensionInterceptor.afterCompletion()
+  DimensionContext.clear()    ← remove()，非 set(null)
+  DataSourceContext.clear()   ← 二期分库时同步清理
+
+独有端点链路（以 beta/perf 为例）：
+GET /beta/perf/perf-metrics
+  → （拦截器同上，表名已设置）
+  → BetaPerfExtController → BetaPerfExtService → BetaPerfExtMapper
+    → DynamicTableNameInnerInterceptor 同样替换表名
+    → 独有 SQL 在正确的表上执行
 ```
-
-### 2.4 完整请求链路说明
-
-以 `GET /fault/distribution/beta_fault` 为例：
-
-1. 请求进入，`RouteInterceptor.preHandle()` 被触发
-2. 从 URI `/fault/distribution/beta_fault` 提取 `beta_fault`
-3. `RouteConfigManager.getRouteConfig("beta_fault")` 返回 `{module=faultDetail, suffix=/betaSuffix, dataSource=beta}`
-4. `RouteContext.setRouteInfo(...)` 将上述信息存入 ThreadLocal
-5. `DataSourceContext.set("beta")` 切换数据源（多数据源模式）
-6. Controller 调用 `FaultDetailFacadeService.queryFaultDetail()`
-7. FacadeService 调用 `BeanRouteFactory.getServiceFromContext(IBaseFaultDetailService.class)`
-8. Factory 从 ThreadLocal 读取 `module=faultDetail, suffix=/betaSuffix`
-9. 在 `serviceRouteMap["faultDetail"]["/betaSuffix"]` 找到 `BetaFaultDetailServiceImpl`
-10. 执行 `BetaFaultDetailServiceImpl.queryFaultDetail()`，返回结果
-11. 请求结束，`afterCompletion` 清理两个 ThreadLocal
 
 ---
 
 ## 第三章：核心设计模式应用
 
-### 3.1 工厂模式 — BeanRouteFactory
+### 3.1 插件模式 — DynamicTableNameInnerInterceptor
 
-**对应类**：`org.cabbage.codedemo.route.factory.BeanRouteFactory`
+**对应类**：`org.cabbage.codedemo.route.config.MybatisPlusConfig`
 
 **代码片段**：
 ```java
-// 二层 Map 结构：module -> suffix -> Bean 实例
-private final Map<String, ConcurrentHashMap<String, Object>> serviceRouteMap = new ConcurrentHashMap<>();
-
-public <T> T getServiceFromContext(Class<T> serviceType) {
-    String moduleName = RouteContext.getModuleName();
-    String routeSuffix = RouteContext.getRouteSuffix();
-    return getService(moduleName, routeSuffix, serviceType);
+@Bean
+public MybatisPlusInterceptor mybatisPlusInterceptor() {
+    MybatisPlusInterceptor interceptor = new MybatisPlusInterceptor();
+    DynamicTableNameInnerInterceptor tableNameInterceptor = new DynamicTableNameInnerInterceptor();
+    tableNameInterceptor.setTableNameHandler((sql, tableName) -> {
+        if ("fault_detail".equals(tableName)) {         // 只替换占位表名
+            String dynamic = DimensionContext.getTableName();
+            return dynamic != null ? dynamic : tableName;
+        }
+        return tableName;
+    });
+    interceptor.addInnerInterceptor(tableNameInterceptor);
+    return interceptor;
 }
 ```
 
-**为什么用工厂模式**：调用方只关心"给我一个当前路由对应的 Service"，不需要知道具体是哪个实现类。工厂封装了查找逻辑，调用方与实现类完全解耦。
-
-**替代方案**：Spring `ApplicationContext.getBean()` 直接查找，但每次都要传类名字符串，调用方必须知道实现类名称，仍有耦合。
+**为什么用插件而不是在 XML 写 `${tableName}`**：MyBatis 的 `${}` 是字符串拼接，存在 SQL 注入风险；`DynamicTableNameInnerInterceptor` 在 SQL 解析层替换，不经过参数绑定，且替换逻辑集中在一处，所有 Mapper（包括扩展 Mapper）自动受益，无需各自处理。
 
 ---
 
-### 3.2 策略模式 — 多 ServiceImpl 实现
+### 3.2 上下文对象模式（ThreadLocal）— DimensionContext
 
-**对应类**：`BetaFaultDetailServiceImpl`、`CommFaultDetailServiceImpl` 等
-
-**代码片段**：
-```java
-// 统一接口
-public interface IBaseFaultDetailService<T> {
-    String queryFaultDistribution();
-    String queryFaultDetail();
-    String countFaults();
-}
-
-// beta 策略实现
-@RouteCustom(suffix = "/betaSuffix", moduleName = "faultDetail")
-@Service
-public class BetaFaultDetailServiceImpl
-        extends BaseFaultDetailServiceImpl<BetaFaultDetailRouterMapper, BetaFaultDetailEntity>
-        implements IBetaFaultDetailService { ... }
-```
-
-**为什么用策略模式**：将"针对 beta 数据库查询"和"针对 comm 数据库查询"封装为两个独立策略，运行时动态选择。新增环境只需新增一个策略类，开闭原则（对扩展开放，对修改封闭）。
-
----
-
-### 3.3 模板方法模式 — BaseFaultDetailServiceImpl
-
-**对应类**：`org.cabbage.codedemo.route.service.impl.BaseFaultDetailServiceImpl`
+**对应类**：`org.cabbage.codedemo.route.context.DimensionContext`
 
 **代码片段**：
 ```java
-// 抽象基类：定义算法骨架
-public abstract class BaseFaultDetailServiceImpl<M extends BaseMapper<T>, T>
-        extends ServiceImpl<M, T> implements IBaseFaultDetailService<T> {
+public class DimensionContext {
+    private static final ThreadLocal<String> DIMENSION_KEY = new ThreadLocal<>();
+    private static final ThreadLocal<String> TABLE_NAME    = new ThreadLocal<>();
 
-    // 模板方法：通用实现，复用于所有子类
-    @Override
-    public String queryFaultDistribution() {
-        BaseFaultDetailRouterMapper routerMapper = getRouterMapper();
-        return routerMapper.queryFaultDistribution();
+    public static void set(String dimensionKey, String tableName) {
+        DIMENSION_KEY.set(dimensionKey);
+        TABLE_NAME.set(tableName);
     }
-}
-```
-
-**为什么用模板方法**：各环境的 Service 大多数方法逻辑相同（都调 Mapper 的同名方法），差异仅在 Mapper 实现。基类提供通用骨架，子类可按需 Override 特有方法（如 `BetaFaultDetailServiceImpl.queryBetaUnique()`）。
-
----
-
-### 3.4 外观模式 — FaultDetailFacadeService
-
-**对应类**：`org.cabbage.codedemo.route.service.impl.FaultDetailFacadeService`
-
-**代码片段**：
-```java
-@Service
-public class FaultDetailFacadeService {
-    private final BeanRouteFactory beanRouteFactory;
-
-    // Controller 只调这一个方法，不用知道路由细节
-    public String queryFaultDetail() {
-        IBaseFaultDetailService<?> service = beanRouteFactory.getServiceFromContext(IBaseFaultDetailService.class);
-        return service.queryFaultDetail();
-    }
-}
-```
-
-**为什么用外观模式**：Controller 层不需要依赖 `BeanRouteFactory`，也不需要知道有多少个 ServiceImpl。FacadeService 提供统一入口，隐藏路由选择的复杂性，简化了 Controller 的依赖关系。
-
----
-
-### 3.5 拦截器模式 — RouteInterceptor
-
-**对应类**：`org.cabbage.codedemo.route.interceptor.RouteInterceptor`
-
-**核心价值**：将路由上下文的设置和清理收敛到请求生命周期的两个切面点（`preHandle` / `afterCompletion`），保证业务代码执行时上下文已就绪，请求结束后上下文被清理，防止内存泄漏和线程污染。
-
----
-
-### 3.6 上下文对象模式（ThreadLocal）— RouteContext / DataSourceContext
-
-**对应类**：`RouteContext`、`DataSourceContext`
-
-**代码片段**：
-```java
-public class RouteContext {
-    private static final ThreadLocal<String> ROUTE_KEY    = new ThreadLocal<>();
-    private static final ThreadLocal<String> ROUTE_SUFFIX = new ThreadLocal<>();
-    private static final ThreadLocal<String> MODULE_NAME  = new ThreadLocal<>();
 
     public static void clear() {
-        ROUTE_KEY.remove();
-        ROUTE_SUFFIX.remove();
-        MODULE_NAME.remove();
+        DIMENSION_KEY.remove();   // remove() 而非 set(null)
+        TABLE_NAME.remove();
     }
 }
 ```
 
-**为什么用 ThreadLocal**：HTTP 请求在 Servlet 容器中由线程池中的单一线程处理，ThreadLocal 提供了线程隔离的上下文存储，无需在方法参数中传递路由信息，调用链路上任意层次均可读取，且天然线程安全。必须配合 `remove()` 防止内存泄漏。
+**为什么用 ThreadLocal**：HTTP 请求由 Servlet 线程池中的单一线程全程处理，ThreadLocal 提供线程隔离的上下文存储，拦截器设置后，调用链路上的 Mapper/Service 无需参数传递即可读取，零侵入。必须用 `remove()` 清理，防止线程池复用导致旧值污染下一个请求。
+
+**为何与 DataSourceContext 独立分开**：单一职责原则。`DimensionContext` 管理表名路由，`DataSourceContext` 管理数据源路由，两者可独立变化。一期只用表名路由，二期叠加数据源路由，互不干扰。
+
+---
+
+### 3.3 拦截器模式 — DimensionInterceptor
+
+**对应类**：`org.cabbage.codedemo.route.interceptor.DimensionInterceptor`
+
+**代码片段**：
+```java
+@Override
+public boolean preHandle(HttpServletRequest req, HttpServletResponse resp, Object handler) {
+    String dimensionKey = extractDimensionKey(req.getRequestURI());
+    DimensionConfig config = dimensionManager.getConfig(dimensionKey);
+    DimensionContext.set(config.getDimensionKey(), config.getTableName());
+    if (config.getDataSource() != null) {
+        DataSourceContext.set(config.getDataSource());  // 二期自动生效
+    }
+    return true;
+}
+
+@Override
+public void afterCompletion(...) {
+    DimensionContext.clear();
+    DataSourceContext.clear();
+}
+
+// URI: /beta/perf/distribution → ["beta","perf","distribution"] → "beta_perf"
+private String extractDimensionKey(String uri) {
+    String[] parts = uri.split("/");
+    return parts.length >= 3 ? parts[1] + "_" + parts[2] : dimensionManager.getDefaultKey();
+}
+```
+
+**核心价值**：将维度上下文的设置与清理收敛到请求生命周期的两个切面点，`preHandle` 保证业务代码执行时上下文就绪，`afterCompletion` 保证请求结束后上下文被彻底清理。WebConfig 将拦截器限定在 `/beta/**` 和 `/comm/**` 路径，不影响其他模块。
+
+---
+
+### 3.4 开闭原则的落地 — 扩展维度零改动现有代码
+
+新增一个维度（如 gamma_normal）的完整步骤：
+
+1. **`application.yml` 加一行配置**：
+```yaml
+gamma_normal:
+  tableName: gamma_normal_fault
+  description: Gamma普通故障
+```
+
+2. **新建扩展文件**（仅当有独有方法时）：
+```java
+// GammaNormalExtMapper.java — 独有 SQL（1-2 个方法）
+// GammaNormalExtService.java — 独有业务逻辑
+// GammaNormalExtController.java — @RequestMapping("/gamma/normal")
+```
+
+公共 Controller、Service、Mapper、拦截器、插件配置——全部零改动。符合**开闭原则**：对扩展开放，对修改封闭。
+
+---
+
+### 3.5 AbstractRoutingDataSource — 二期数据源路由
+
+**对应类**：`org.cabbage.codedemo.route.routing.DynamicRoutingDataSource`
+
+```java
+public class DynamicRoutingDataSource extends AbstractRoutingDataSource {
+    @Override
+    protected Object determineCurrentLookupKey() {
+        return DataSourceContext.get();  // 从 ThreadLocal 取数据源 key
+    }
+}
+```
+
+**与动态表名的协作**：两个插件独立工作，互不依赖。`DynamicRoutingDataSource` 在连接层决定"连哪个库"，`DynamicTableNameInnerInterceptor` 在 SQL 层决定"查哪张表"。`DimensionInterceptor` 在 `preHandle` 中同时向两个 ThreadLocal 写入，二期升级只需填写 yml 的 `dataSource` 字段并激活 `DynamicDataSourceConfig`，业务代码零改动。
 
 ---
 
@@ -233,9 +234,9 @@ public class RouteContext {
 
 ### 精简版（约150字，适合简历主体）
 
-**动态业务路由框架**（Spring Boot 3.5.6 / MyBatis-Plus）
+**多维度故障数据动态表名路由**（Spring Boot 3.5.6 / MyBatis-Plus）
 
-设计并实现了基于注解驱动的动态路由框架，解决多环境（beta/comm）下故障数据查询的路由分发问题。核心设计：自定义 `@RouteCustom` 注解标记各环境 Service 实现；`BeanRouteFactory` 在启动时扫描并建立二层 ConcurrentHashMap 路由表（module → suffix → Bean）；`RouteInterceptor` 拦截请求，从 URL 提取路由 key 并写入 ThreadLocal 上下文；`FaultDetailFacadeService` 作为统一外观，屏蔽路由细节。新增业务环境只需新增一个 ServiceImpl 并打注解，零改动现有代码，完全符合开闭原则。扩展支持多数据源透明切换（`AbstractRoutingDataSource`），实现数据库级别的路由隔离。
+识别并解决了故障数据平台"6套重复代码仅表名不同"的设计缺陷。六个展示维度（beta/comm × 普通/性能/三方故障）对应六张同构表，重构后通过 MyBatis-Plus `DynamicTableNameInnerInterceptor` 实现动态表名替换，6 套 Mapper/Service/Controller 合并为 1 套，各维度独有方法由薄扩展层独立维护。`DimensionInterceptor` 从 URL 路径提取维度标识写入 ThreadLocal，插件在 SQL 执行前自动替换占位表名，业务层对表路由细节完全无感知。新增维度只需 yml 加一行配置，符合开闭原则。二期通过 `AbstractRoutingDataSource` + `DataSourceContext` 扩展支持 beta/comm 分库，代码零改动。
 
 ---
 
@@ -243,86 +244,83 @@ public class RouteContext {
 
 **项目背景**
 
-在故障数据查询平台中，同一套业务逻辑需要对接 beta、comm 两个独立环境的数据库，且未来需扩展至更多环境。初版使用 if-else 硬编码判断环境，导致每次新增环境需要修改多处业务代码，维护成本极高。
+故障数据查询平台按 beta/comm × 普通/性能/三方故障维度展示六类数据，历史代码实现了六套从 Controller 到 Mapper 的完全重复代码，仅 Mapper XML 中的表名不同（六张表结构完全一致）。这导致每次修改公共逻辑需同步改六处，新增维度需整套复制粘贴，维护成本极高。
 
-**核心设计**
+**核心诊断**
 
-重构后采用"注解 + 工厂 + 拦截器"三层解耦架构：
+问题根源是抽象层次错误：六张同构表的差异只是表名，不应该通过六套 Bean 来表达，而应通过"一套 Bean + 动态表名"来解决。
 
-1. **路由注解层**：自定义 `@RouteCustom(suffix, moduleName)` 注解，打在各 ServiceImpl/Mapper 上，声明该 Bean 所属的模块和路由后缀
-2. **启动注册层**：`BeanRouteFactory` 实现 `ApplicationContextAware`，启动时扫描所有带 `@RouteCustom` 的 Bean，建立二层 ConcurrentHashMap 路由表：`serviceRouteMap[module][suffix] = beanInstance`
-3. **请求路由层**：`RouteInterceptor` 在 `preHandle` 阶段从 URL 路径提取 routeKey，查询 `RouteConfigManager`（配置来自 `application.yml`），将 module/suffix 信息写入 `RouteContext`（ThreadLocal）；`afterCompletion` 强制清理，防止内存泄漏
-4. **业务调用层**：`FaultDetailFacadeService` 作为外观，调用 `BeanRouteFactory.getServiceFromContext()` 动态获取当前路由对应的 Service 实现，Controller 无需关心路由细节
+**最终架构**
 
-**设计模式应用**
+采用 MyBatis-Plus `DynamicTableNameInnerInterceptor` 作为核心机制：
 
-综合运用了工厂模式（BeanRouteFactory）、策略模式（多 ServiceImpl）、模板方法模式（BaseFaultDetailServiceImpl）、外观模式（FaultDetailFacadeService）、拦截器模式和 ThreadLocal 上下文对象模式。
+1. **Mapper 层**：`FaultDetailMapper` 单一 Mapper，XML 中使用 `fault_detail` 作为占位表名；独有方法各维度新建薄 ExtMapper（1-2 个方法），同样使用占位表名，自动享受动态替换
+2. **插件层**：`MybatisPlusConfig` 注册 `DynamicTableNameInnerInterceptor`，`TableNameHandler` 从 `DimensionContext`（ThreadLocal）读取真实表名，替换 SQL 中所有 `fault_detail` 出现
+3. **拦截层**：`DimensionInterceptor` 在 `preHandle` 阶段从 URL 路径的前两段（`/{module}/{domain}/...`）提取维度 key，查询 `DimensionManager` 获取 `DimensionConfig{tableName, dataSource}`，写入 `DimensionContext`；`afterCompletion` 强制 `remove()` 清理
+4. **Controller 层**：`FaultCommonController` 用路径变量统一处理全部六个维度的公共端点；各维度独有端点由薄 ExtController 单独暴露
 
-**多数据源扩展**
+**二期分库扩展**
 
-在路由框架基础上，引入 `AbstractRoutingDataSource` 实现数据库级路由：`RouteConfig` 新增 `dataSource` 字段，拦截器同时向 `DataSourceContext`（独立 ThreadLocal）写入数据源 key，`DynamicRoutingDataSource.determineCurrentLookupKey()` 返回该 key，MyBatis 自动选择对应数据库连接，对业务代码完全透明。
+`DimensionConfig` 增加 `dataSource` 字段，`DimensionInterceptor.preHandle()` 同时向 `DataSourceContext` 写入数据源 key，`DynamicRoutingDataSource`（继承 `AbstractRoutingDataSource`）在连接获取时读取该 key 选择对应数据库，两层路由（表名 + 数据源）独立工作，对业务代码透明。
 
 **核心收益**
 
-- 新增一个路由环境：只需新增一个 ServiceImpl + `application.yml` 一行配置，零改动现有代码
-- 严格模式/非严格模式可配置：`route.strict-mode=true` 时路由不存在直接抛异常；`false` 时降级到默认路由
-- 线程安全：ConcurrentHashMap 路由表 + ThreadLocal 上下文，支持高并发场景
+- 公共代码从 6 套压缩为 1 套，独有代码精确隔离（每个维度 3 个薄文件）
+- 新增维度：yml 一行 + 扩展文件，零改动现有代码
+- 两层路由（表名/数据源）通过同一个拦截器 + 两个独立 ThreadLocal 管理，职责清晰
 
 ---
 
 ### 亮点提炼（大厂面试官视角）
 
-- **开闭原则落地**：通过注解扫描 + 工厂模式，新增路由环境对现有代码零侵入，工程化扩展能力强
-- **ThreadLocal 生命周期管理**：在拦截器的 `afterCompletion` 强制 `remove()`，而非 `set(null)`，彻底解决线程池复用场景下的内存泄漏问题
-- **多层路由体系**：URL 层（routeKey）→ 配置层（module/suffix）→ Bean 层（ServiceImpl 实例），三层解耦，各层可独立变更
-- **数据库透明切换**：`AbstractRoutingDataSource` 接入 ThreadLocal，实现请求粒度的数据源切换，对 MyBatis/业务层完全透明
-- **设计反思能力**：能指出初版 if-else 的痛点，能分析现版方案的性能边界（启动时建表 O(1) 查找），能对比 ShardingSphere 等方案的适用场景
+- **问题识别能力**：准确诊断"6套重复代码"的根本原因是抽象层次错误，而非简单的"代码没有复用"，并给出匹配问题本质的解决方案
+- **MyBatis-Plus 深度使用**：`DynamicTableNameInnerInterceptor` 的 `TableNameHandler` 结合 ThreadLocal，实现 SQL 执行前透明的表名替换，规避 `${}` 拼接的 SQL 注入风险
+- **ThreadLocal 生命周期管理**：拦截器 `afterCompletion` 使用 `remove()` 而非 `set(null)`，彻底清理 `ThreadLocalMap` Entry，防止线程池复用场景的内存泄漏
+- **两层路由解耦**：表名路由（`DimensionContext`）和数据源路由（`DataSourceContext`）独立 ThreadLocal 独立管理，一期只启用表名路由，二期叠加数据源路由，互不干扰
+- **渐进式升级设计**：二期 `AbstractRoutingDataSource` 所需的代码（`DataSourceContext`、`DynamicRoutingDataSource`、`DynamicDataSourceConfig`）一期已完整实现，升级仅需填写 yml 字段并激活配置，体现了前瞻性设计意识
 
 ---
 
-## 第五章：多数据库路由扩展方案
+## 第五章：二期多数据库路由扩展方案
 
-### 5.1 痛点与动机
+### 5.1 背景
 
-同一套 Service/Mapper 路由体系，beta 环境和 comm 环境的数据存放在**不同数据库**（`code_demo_beta` / `code_demo_comm`）。如果在每个 Mapper 实现中配置不同的数据源，配置散乱且难以管理。目标是：路由 key 不仅决定"调哪个 Service 实现"，还决定"连哪个数据库"，对业务代码完全透明。
+二期中 beta 和 comm 各自独立建库，每库三张表（`normal_fault`、`perf_fault`、`third_fault`），表名在各自库内无需前缀。需要在一期动态表名路由的基础上，叠加数据源路由，实现"连哪个库 + 查哪张表"的组合路由。
 
-### 5.2 技术方案选型
+### 5.2 技术选型
 
-| 方案 | 优点 | 缺点 | 适用场景 |
-|------|------|------|---------|
-| AbstractRoutingDataSource | Spring 原生，侵入小，与现有路由框架天然对齐 | 不支持分库分表，单库事务 | 数据库实例少、路由规则简单 |
-| MyBatis Plugin（Interceptor）| SQL 级别拦截，精确控制 | 实现复杂，维护成本高 | 需要 SQL 改写、动态表名 |
-| ShardingSphere Proxy | 功能全面，支持分库分表 | 引入独立中间件，运维成本高 | 大规模分库分表场景 |
+| 方案 | 优点 | 缺点 | 结论 |
+|------|------|------|------|
+| AbstractRoutingDataSource | Spring 原生，与已有 ThreadLocal 体系天然对齐，改动极小 | 不支持分库分表，连接数随数据源数量线性增长 | 选用 |
+| ShardingSphere | 功能全面，内置读写分离/分库分表 | 引入独立中间件，运维成本高，本场景属于过度设计 | 不选 |
+| MyBatis Plugin 手动切换 | 精确到 SQL 级别 | 职责错位，与 DynamicTableNameInnerInterceptor 冲突 | 不选 |
 
-**本项目选择 AbstractRoutingDataSource**：路由逻辑已有完整的 ThreadLocal 体系，只需在 `determineCurrentLookupKey()` 中返回 ThreadLocal 的值即可接入，改动最小、对现有架构侵入最低。
+### 5.3 升级步骤（三处改动）
 
-### 5.3 核心设计
-
-**组件关系**：
-
-```
-RouteInterceptor.preHandle()
-    ├── RouteContext.set(module, suffix)      ← 决定调哪个 ServiceImpl
-    └── DataSourceContext.set("beta"/"comm")  ← 决定连哪个数据库
-
-DynamicRoutingDataSource.determineCurrentLookupKey()
-    └── return DataSourceContext.get()        ← Spring 据此选择数据源
-
-MyBatis / HikariCP
-    └── 从 DynamicRoutingDataSource 获取对应数据库连接
-```
-
-**RouteConfig 扩展**：新增 `dataSource` 字段，将路由 key 和数据源 key 在配置层绑定，而非在代码中硬编码：
-```yaml
-beta_fault:
-  module: faultDetail
-  suffix: /betaSuffix
-  dataSource: beta     # 对应 DynamicRoutingDataSource 中注册的 key
-```
-
-### 5.4 配置层（application.yml 多数据源配置）
+**1. application.yml 填写 dataSource 字段，表名去掉 beta_/comm_ 前缀**
 
 ```yaml
+dimension:
+  mappings:
+    beta_normal:
+      tableName: normal_fault    # 库内表名，无需前缀
+      dataSource: beta
+    beta_perf:
+      tableName: perf_fault
+      dataSource: beta
+    beta_third:
+      tableName: third_fault
+      dataSource: beta
+    comm_normal:
+      tableName: normal_fault    # comm 库中同名表，数据源区分
+      dataSource: comm
+    comm_perf:
+      tableName: perf_fault
+      dataSource: comm
+    comm_third:
+      tableName: third_fault
+      dataSource: comm
+
 spring:
   datasource:
     beta:
@@ -337,147 +335,38 @@ spring:
       password: 1234567a
 ```
 
-### 5.5 完整代码
+**2. DynamicDataSourceConfig 激活**（加上 `@Configuration` 注解即可，代码已完整实现）
 
-**DataSourceContext.java**
-```java
-package org.cabbage.codedemo.route.context;
+**3. 业务代码零改动**（`DimensionInterceptor` 已预留 DataSourceContext 写入逻辑）
 
-public class DataSourceContext {
-    private static final ThreadLocal<String> DATA_SOURCE_KEY = new ThreadLocal<>();
-
-    public static void set(String key)  { DATA_SOURCE_KEY.set(key);    }
-    public static String get()          { return DATA_SOURCE_KEY.get(); }
-    public static void clear()          { DATA_SOURCE_KEY.remove();     }
-}
-```
-
-**DynamicRoutingDataSource.java**
-```java
-package org.cabbage.codedemo.route.routing;
-
-import org.cabbage.codedemo.route.context.DataSourceContext;
-import org.springframework.jdbc.datasource.lookup.AbstractRoutingDataSource;
-
-public class DynamicRoutingDataSource extends AbstractRoutingDataSource {
-    @Override
-    protected Object determineCurrentLookupKey() {
-        return DataSourceContext.get();
-    }
-}
-```
-
-**DynamicDataSourceConfig.java**
-```java
-package org.cabbage.codedemo.route.config;
-
-import com.zaxxer.hikari.HikariDataSource;
-import org.cabbage.codedemo.route.routing.DynamicRoutingDataSource;
-import org.springframework.boot.context.properties.ConfigurationProperties;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.context.annotation.Primary;
-import javax.sql.DataSource;
-import java.util.HashMap;
-import java.util.Map;
-
-@Configuration
-public class DynamicDataSourceConfig {
-
-    @Bean("betaDataSource")
-    @ConfigurationProperties(prefix = "spring.datasource.beta")
-    public DataSource betaDataSource() {
-        return new HikariDataSource();
-    }
-
-    @Bean("commDataSource")
-    @ConfigurationProperties(prefix = "spring.datasource.comm")
-    public DataSource commDataSource() {
-        return new HikariDataSource();
-    }
-
-    @Bean
-    @Primary
-    public DynamicRoutingDataSource dynamicDataSource() {
-        DynamicRoutingDataSource dynamic = new DynamicRoutingDataSource();
-
-        Map<Object, Object> targetDataSources = new HashMap<>();
-        targetDataSources.put("beta", betaDataSource());
-        targetDataSources.put("comm", commDataSource());
-
-        dynamic.setTargetDataSources(targetDataSources);
-        dynamic.setDefaultTargetDataSource(betaDataSource());
-        dynamic.afterPropertiesSet();
-        return dynamic;
-    }
-}
-```
-
-**RouteConfig.java（新增字段）**
-```java
-/**
- * 对应的数据源 key，与 DynamicRoutingDataSource 中注册的 key 一致
- * 例如：beta / comm，为空时不切换数据源
- */
-private String dataSource;
-```
-
-**RouteInterceptor.java（扩展 preHandle 和 afterCompletion）**
-```java
-// preHandle 中：
-RouteContext.setRouteInfo(routeKey, config.getSuffix(), config.getModule());
-if (config.getDataSource() != null) {
-    DataSourceContext.set(config.getDataSource());
-}
-
-// afterCompletion 中：
-RouteContext.clear();
-DataSourceContext.clear();
-```
-
-### 5.6 类图（文字版）
+### 5.4 两层路由协作图
 
 ```
-HandlerInterceptor
-    └── RouteInterceptor
-            ├── RouteContext (ThreadLocal: routeKey, suffix, module)
-            └── DataSourceContext (ThreadLocal: dataSourceKey)
-
-AbstractRoutingDataSource
-    └── DynamicRoutingDataSource
-            └── determineCurrentLookupKey() → DataSourceContext.get()
-
-RouteConfigManager
-    └── Map<routeKey, RouteConfig{module, suffix, dataSource, enabled}>
-
-BeanRouteFactory (ApplicationContextAware)
-    ├── serviceRouteMap: Map<module, Map<suffix, ServiceBean>>
-    └── mapperRouteMap:  Map<module, Map<suffix, MapperBean>>
+DimensionInterceptor.preHandle()
+    ├── DimensionContext.set("beta_normal", "normal_fault")
+    │       ↓
+    │   DynamicTableNameInnerInterceptor
+    │       SELECT ... FROM normal_fault （表名已替换）
+    │
+    └── DataSourceContext.set("beta")
+            ↓
+        DynamicRoutingDataSource.determineCurrentLookupKey() → "beta"
+            ↓
+        Spring 选择 betaDataSource 连接池 → 连 beta 库
 ```
 
-### 5.7 事务问题分析
+最终效果：`beta_normal` 请求查询 beta 库的 `normal_fault` 表；`comm_normal` 请求查询 comm 库的 `normal_fault` 表。
 
-**单库事务（当前场景）**：每次请求只切换到一个数据源，`@Transactional` 工作正常，Spring 的 `DataSourceTransactionManager` 自动绑定当前线程的数据源连接。
+### 5.5 事务问题分析
 
-**多库分布式事务（跨库场景）**：若一个请求中需要同时操作 beta 库和 comm 库，本地事务无法保证原子性，需要：
-- **Seata AT 模式**：侵入性低，适合对强一致性要求不极端的场景
-- **TCC 模式**：性能好，适合高并发，但实现复杂，需手动实现 try/confirm/cancel 逻辑
-- **最终一致性**：通过消息队列（RocketMQ）异步补偿，适合允许短暂不一致的业务
+**单库场景（一期 / 二期各维度独立操作）**：每次请求只操作一个数据源，`@Transactional` 通过 `DataSourceTransactionManager` 正常工作。注意：数据源必须在事务开始前就设置好（本项目拦截器在 Controller 执行前已设置，符合要求）。
 
-当前项目场景：beta 和 comm 环境数据相互独立，单次请求只访问一个库，无跨库事务问题。
+**跨库场景（若需同时操作 beta 和 comm 库）**：本地事务无法保证原子性，需要：
+- **Seata AT 模式**：侵入性低，基于 undo log，适合对强一致性要求不极端的场景
+- **TCC 模式**：高性能，需手动实现 try/confirm/cancel 三阶段，开发成本高
+- **最终一致性（消息补偿）**：通过 RocketMQ 异步补偿，适合允许短暂不一致的业务
 
-### 5.8 与 ShardingSphere 方案对比
-
-| 维度 | 本项目方案 | ShardingSphere |
-|------|-----------|----------------|
-| 适用场景 | 少量数据库实例，路由规则简单（按环境） | 大规模分库分表，单表亿级数据 |
-| 引入成本 | 极低（Spring 原生 AbstractRoutingDataSource） | 引入独立 Proxy 或 JDBC 依赖，配置复杂 |
-| 路由规则灵活性 | 完全自定义（URL 路径、Header、业务字段均可） | 主要支持分片键规则 |
-| 读写分离 | 需自行实现 | 内置读写分离支持 |
-| 分布式事务 | 需接入 Seata | 内置 XA 事务支持 |
-| 运维复杂度 | 低（无独立进程） | 高（Proxy 模式需独立部署） |
-
-**结论**：本项目的路由需求是"按业务环境选择数据库"，数据库数量少（2-10 个），业务规则简单，`AbstractRoutingDataSource` 是最合适的选择。ShardingSphere 适合数据量极大、需要水平分片的场景，在本项目中属于过度设计。
+当前项目中 beta 和 comm 数据相互独立，单次请求只访问一个库，无跨库事务需求。
 
 ---
 
@@ -487,172 +376,206 @@ BeanRouteFactory (ApplicationContextAware)
 
 ### L1 基础原理（5题）
 
-**Q1：@RouteCustom 注解如何被扫描和注册？**
+**Q1：DynamicTableNameInnerInterceptor 的工作原理？**
 
-`BeanRouteFactory` 实现了 `ApplicationContextAware` 接口。在 Spring 容器初始化完成后，`setApplicationContext()` 被调用。此时调用 `applicationContext.getBeansWithAnnotation(RouteCustom.class)` 获取所有带该注解的 Bean，遍历后通过 `AopUtils.getTargetClass(bean)` 获取代理后的真实类，再读取注解上的 `moduleName` 和 `suffix`，存入二层 ConcurrentHashMap 路由表。
+`DynamicTableNameInnerInterceptor` 是 MyBatis-Plus 的内置拦截器，实现了 `InnerInterceptor` 接口。其工作流程：
 
----
+1. 在 MyBatis 执行 SQL 前，拦截 `Executor` 的 `query`/`update` 方法
+2. 使用 JSqlParser 解析 SQL，提取其中所有的表名
+3. 对每个表名调用 `TableNameHandler.dynamicTableName(sql, tableName)`
+4. 将 handler 返回的新表名替换回 SQL 中
+5. 用替换后的 SQL 执行查询
 
-**Q2：ThreadLocal 的原理和使用场景？**
+本项目的 handler：
+```java
+(sql, tableName) -> {
+    if ("fault_detail".equals(tableName)) {     // 只替换占位表名
+        String dynamic = DimensionContext.getTableName();
+        return dynamic != null ? dynamic : tableName;
+    }
+    return tableName;
+}
+```
 
-每个 `Thread` 对象内部有一个 `ThreadLocalMap`（`Thread.threadLocals`）。`ThreadLocal.set(value)` 以当前 ThreadLocal 实例为 key、value 为 value，存入当前线程的 `ThreadLocalMap`。`get()` 同理从当前线程的 map 中取值。
-
-核心特性：每个线程有自己独立的副本，线程间不共享。
-
-适用场景：
-- 请求上下文传递（本项目：路由 key、数据源 key）
-- 数据库连接/Session 管理
-- 用户登录信息传递（`SecurityContextHolder`）
-
-注意：使用线程池时，线程会被复用，必须在请求结束后调用 `remove()`，否则旧的值会"污染"下一个请求。
-
----
-
-**Q3：AopUtils.getTargetClass() 为什么要用？**
-
-Spring AOP 默认通过 JDK 动态代理或 CGLIB 为 Bean 创建代理对象。`applicationContext.getBeansWithAnnotation()` 返回的 Bean 实际上是代理对象，直接对代理对象调用 `getClass()` 得到的是代理类（如 `$Proxy32` 或 `BetaFaultDetailServiceImpl$$SpringCGLIB$$0`），代理类上不一定有 `@RouteCustom` 注解。
-
-`AopUtils.getTargetClass(bean)` 能穿透代理，返回被代理的原始目标类（`BetaFaultDetailServiceImpl`），从而正确读取注解。
+通过只替换 `fault_detail`，避免影响其他表（如 `information_schema.TABLES` 等系统表）。
 
 ---
 
-**Q4：ConcurrentHashMap 为什么比 HashMap 更适合这个场景？**
+**Q2：为什么 Mapper XML 用 `fault_detail` 作为占位表名，而不是用 `${tableName}` 参数传入？**
 
-`BeanRouteFactory` 中的路由表 `serviceRouteMap` 在应用启动时由单线程写入，此后只有读操作（每个 HTTP 请求都会读）。
+`${tableName}` 是 MyBatis 的字符串拼接语法，直接将参数值拼入 SQL 字符串，存在 SQL 注入风险——如果 `tableName` 被恶意构造为 `a; DROP TABLE beta_normal_fault`，SQL 会被注入。
 
-选 ConcurrentHashMap 的原因：
-1. **线程安全的读**：高并发下多线程同时读，ConcurrentHashMap 保证可见性，HashMap 的内部结构变更可能导致读到不一致状态（尽管 JDK8+ 的 HashMap 读在大多数情况下是安全的，但这依赖实现细节，不是规范保证）
-2. **防御性编程**：如果未来加入动态路由更新（热更新），写操作会并发发生，ConcurrentHashMap 天然支持
+`DynamicTableNameInnerInterceptor` 在 SQL 解析层替换，使用 JSqlParser 识别 SQL 语法中的表名部分，只替换合法的标识符位置，不会引入注入风险。同时，替换逻辑集中在一个 handler 中，所有 Mapper（公共 + 扩展）自动受益，不需要各自在方法签名上增加 `tableName` 参数。
 
 ---
 
-**Q5：Spring 拦截器和 AOP 切面的区别？**
+**Q3：ThreadLocal 的原理和使用场景？**
+
+每个 `Thread` 对象内部有一个 `ThreadLocalMap`（`Thread.threadLocals`）。`ThreadLocal.set(value)` 以当前 ThreadLocal 实例为 key（弱引用），value 为 value，存入当前线程的 map。`get()` 从当前线程的 map 中查找。
+
+核心特性：每个线程有自己独立的副本，线程间不共享，天然隔离。
+
+本项目有两个 ThreadLocal：
+- `DimensionContext`：存储 dimensionKey 和 tableName，供 `DynamicTableNameInnerInterceptor` 读取
+- `DataSourceContext`：存储 dataSource key，供 `DynamicRoutingDataSource` 读取
+
+**内存泄漏风险**：`ThreadLocalMap` 的 key 是弱引用，value 是强引用。当 ThreadLocal 实例被 GC 后 key 变 null，但 value 仍被强引用，在线程池场景下线程不销毁，泄漏持续积累。本项目在 `afterCompletion` 中调用 `remove()`（非 `set(null)`），彻底删除 Entry。
+
+---
+
+**Q4：Spring 拦截器（HandlerInterceptor）和 AOP 切面（@Aspect）的区别？**
 
 | 维度 | HandlerInterceptor | AOP（@Aspect）|
 |------|-------------------|--------------|
-| 作用层次 | Web 层（DispatcherServlet 之后，Controller 之前） | 任意 Spring Bean 方法 |
-| 能访问 HTTP 请求/响应 | 能（`HttpServletRequest`） | 不能（需注入 `RequestContextHolder`）|
-| 粒度 | 请求级别 | 方法级别（可精确到参数、返回值）|
-| 典型用途 | 认证鉴权、路由上下文注入、日志 | 事务、缓存、性能监控 |
+| 作用层次 | Web 层，DispatcherServlet 之后、Controller 之前 | 任意 Spring Bean 方法 |
+| 能访问 HTTP 请求 | 能（`HttpServletRequest`，读取 URI） | 不能（需借助 `RequestContextHolder`）|
+| 清理时机 | `afterCompletion`：视图渲染完成后，响应已返回 | `@After`/`@AfterReturning`：方法返回后，但在 AOP 代理栈内 |
+| 典型用途 | 认证鉴权、上下文注入、ThreadLocal 清理 | 事务、缓存、性能监控 |
 
-本项目选拦截器：路由设置是 HTTP 请求级别的操作，需要访问 URI，且需要在响应返回后（`afterCompletion`）清理上下文，拦截器的生命周期钩子天然匹配。
+本项目选拦截器：需要从 URI 提取维度 key，必须访问 `HttpServletRequest`；`afterCompletion` 是清理 ThreadLocal 的最佳时机（保证在视图渲染之后也能清理）。
+
+---
+
+**Q5：WebConfig 中为什么只拦截 `/beta/**` 和 `/comm/**`？**
+
+```java
+registry.addInterceptor(dimensionInterceptor)
+        .addPathPatterns("/beta/**", "/comm/**");
+```
+
+两个原因：
+
+1. **防止误匹配**：`DimensionInterceptor` 的 URI 解析逻辑假定路径格式为 `/{module}/{domain}/...`，如果拦截 `/**`，`/actuator/health`、`/error` 等路径也会被解析，`parts[1]="actuator"`、`parts[2]="health"` 会组成 `actuator_health`，找不到维度配置后降级到默认维度，引发非预期行为。
+2. **职责明确**：拦截器只负责故障数据查询的路由，非业务路径不应进入路由逻辑。
 
 ---
 
 ### L2 设计理解（8题）
 
-**Q6：为什么用二层 Map 结构而不是拼接字符串做 key？**
+**Q6：DimensionConfig 中的 dataSource 字段一期为空，是怎么处理的？**
 
-字符串拼接方案（如 `faultDetail:/betaSuffix`）的问题：
-1. 分隔符的选择需要保证 module 和 suffix 中不包含该分隔符，有隐患
-2. 查找时每次都要做字符串拼接，有轻微的性能开销
-3. 无法做到"按 module 枚举所有路由"等操作，扩展性差
+`DimensionInterceptor.preHandle()` 中：
 
-二层 Map 的优点：
-1. 结构清晰，层次语义明确（第一层按模块聚合，第二层按环境聚合）
-2. 可以快速查询某个 module 下有哪些 suffix，便于路由管理和校验
-3. `computeIfAbsent` 可以懒初始化内层 Map，代码简洁
-
----
-
-**Q7：严格模式 vs 非严格模式的设计权衡？**
-
-`route.strict-mode` 配置项：
-- **严格模式（true）**：路由 key 不存在直接抛 RuntimeException，适合生产环境，快速暴露配置问题，防止静默走错数据源
-- **非严格模式（false，默认）**：路由不存在时降级到默认路由，适合开发/测试环境，容错性高，不会因配置遗漏导致功能完全不可用
-
-权衡点：严格模式更"快速失败"（Fail Fast），符合生产环境对正确性的要求；非严格模式更"宽容"，适合开发阶段。通过配置分离，两种行为都能覆盖，而不是硬编码某一种。
-
----
-
-**Q8：ThreadLocal 会导致内存泄漏吗？如何在本项目中解决？**
-
-会。原因：`ThreadLocalMap` 的 key（ThreadLocal 实例）使用弱引用，但 value（存储的上下文对象）是强引用。当 ThreadLocal 实例被 GC 后，key 变为 null，但 value 仍被 `ThreadLocalMap` 强引用，无法被回收，形成内存泄漏。在线程池场景下，线程不会销毁，泄漏会持续积累。
-
-本项目的解决方式：`RouteInterceptor.afterCompletion()` 中调用 `RouteContext.clear()` 和 `DataSourceContext.clear()`，其内部使用 `ThreadLocal.remove()` 彻底删除 Entry，而不是 `set(null)`（set null 只是将 value 置为 null，Entry 仍在 map 中）。
-
----
-
-**Q9：外观模式在这里的价值是什么？**
-
-`FaultDetailFacadeService` 作为外观层，将 `BeanRouteFactory` 的调用封装起来。Controller 只需依赖 `FaultDetailFacadeService`，不需要知道：
-1. `BeanRouteFactory` 的存在
-2. `IBaseFaultDetailService` 接口
-3. 路由是通过 ThreadLocal 上下文传递的
-
-价值：**降低 Controller 的认知负担和依赖范围**。如果未来路由机制改变（比如从 ThreadLocal 改为从 Header 读取），只需改 FacadeService 和 Factory，Controller 零改动。这也体现了**迪米特法则（最少知道原则）**：Controller 只需要知道"有这么一个 Facade 能查故障详情"，其余细节全部隐藏。
-
----
-
-**Q10：为什么用拦截器而不是过滤器或 AOP 来注入路由上下文？**
-
-| 方案 | 问题 |
-|------|------|
-| Servlet Filter | 在 DispatcherServlet 之前执行，此时 Spring MVC 的 URL 映射尚未解析，无法方便地获取到 PathVariable、HandlerMethod 等信息 |
-| AOP @Around | 需要选定切入点（如 `@Controller`），但执行时机在方法调用层，afterReturning 无法像 `afterCompletion` 一样在请求最终完成后才清理 |
-| HandlerInterceptor | 在 DispatcherServlet 之后，Controller 执行之前，能访问完整的 `HttpServletRequest`，且 `afterCompletion` 保证在视图渲染之后调用，是清理 ThreadLocal 的最佳时机 |
-
-选拦截器是因为其生命周期与 HTTP 请求完全对齐，且能直接访问 Web 层信息（URI 路径），无需通过 `RequestContextHolder` 间接获取。
-
----
-
-**Q11：如何扩展支持一个新的业务环境（如 gamma）？**
-
-三步操作，零改动现有代码：
-
-1. **新建 ServiceImpl**（打注解即可自动注册）：
 ```java
-@RouteCustom(suffix = "/gammaSuffix", moduleName = "faultDetail")
-@Service
-public class GammaFaultDetailServiceImpl
-        extends BaseFaultDetailServiceImpl<GammaFaultDetailRouterMapper, GammaFaultDetailEntity>
-        implements IGammaFaultDetailService { }
-```
-
-2. **新建 Mapper 和 Entity**（仅改表名）：
-```java
-@RouteCustom(suffix = "/gammaSuffix", moduleName = "faultDetail")
-@Mapper
-public interface GammaFaultDetailRouterMapper extends BaseFaultDetailRouterMapper { }
-```
-
-3. **在 application.yml 添加路由配置**：
-```yaml
-gamma_fault:
-  module: faultDetail
-  suffix: /gammaSuffix
-  description: Gamma-env
-  enabled: true
-  dataSource: gamma
-```
-
-Controller 不用改，Service 逻辑不用改，工厂不用改——完全符合开闭原则。
-
----
-
-**Q12：ApplicationContextAware 在 BeanRouteFactory 中的作用？**
-
-`ApplicationContextAware` 是 Spring 的 Aware 接口，实现该接口的 Bean 在容器初始化完成后，会由 Spring 自动调用 `setApplicationContext(ctx)` 方法，将 `ApplicationContext` 注入。
-
-在 `BeanRouteFactory` 中，利用这个时机调用 `ctx.getBeansWithAnnotation(RouteCustom.class)` 扫描所有带注解的 Bean，此时所有 Bean 都已完成初始化（包括 AOP 代理的创建），可以安全地遍历和注册。
-
-如果改用 `@PostConstruct`，此时注入的 ApplicationContext 可能尚未完全就绪；如果改用监听 `ContextRefreshedEvent`，则需要处理事件可能多次触发的问题（父子容器各触发一次）。`ApplicationContextAware` 的触发时机恰好是容器刷新完成、所有单例 Bean 初始化后，最为合适。
-
----
-
-**Q13：如果同一个 module+suffix 注册了两个 Bean，会发生什么？**
-
-在 `BeanRouteFactory.registerBean()` 方法中：
-```java
-if (routeMap.containsKey(suffix)) {
-    log.warn("路由已存在，将被覆盖: ...");
+if (config.getDataSource() != null) {
+    DataSourceContext.set(config.getDataSource());
 }
-routeMap.put(suffix, bean);  // 后注册的覆盖先注册的
 ```
 
-当前行为：**后注册的 Bean 覆盖先注册的**，并打 warn 日志。这意味着路由结果取决于 Spring Bean 扫描顺序，具有不确定性。
+一期 yml 中不填 `dataSource`，`getDataSource()` 返回 null，跳过 `DataSourceContext.set()`，`DynamicRoutingDataSource.determineCurrentLookupKey()` 返回 null，`AbstractRoutingDataSource` 使用默认数据源（单库模式正常工作）。
 
-改进方案：在 `validateConfig()` 阶段检测重复注册，直接抛出 `BeanDefinitionStoreException`，在启动时快速失败，而不是运行时静默覆盖。
+二期填写 `dataSource: beta/comm` 后，`DataSourceContext` 被写入，动态数据源自动切换。这是**渐进式升级**设计——代码在一期就为二期的扩展留好了钩子，二期只需填写配置，不需要修改任何代码逻辑。
+
+---
+
+**Q7：为什么 DimensionContext 和 DataSourceContext 是两个独立的 ThreadLocal 类，而不是合并为一个？**
+
+**单一职责原则**：`DimensionContext` 的消费方是 `DynamicTableNameInnerInterceptor`（MyBatis 层），`DataSourceContext` 的消费方是 `DynamicRoutingDataSource`（JDBC 连接层）。两者在不同的技术栈层次工作，职责不同。
+
+**独立可变**：如果未来只想改动数据源路由逻辑（比如支持读写分离），不需要触碰 `DimensionContext`；反之亦然。合并后任何一方的变化都会影响另一方。
+
+**测试隔离**：单独测试表名路由时，不需要模拟数据源上下文；单独测试数据源路由时，不需要模拟表名上下文。
+
+---
+
+**Q8：ThreadLocal 会导致内存泄漏吗？本项目如何解决？**
+
+会。`ThreadLocalMap` 的 key（ThreadLocal 实例）使用**弱引用**，但 value（存储的对象）是**强引用**。当 ThreadLocal 实例被 GC 后，key 变为 null，但 value 仍被 map 强引用，无法被 GC 回收。在 Tomcat 线程池场景下，线程长期存活，泄漏会持续积累。
+
+本项目解决方式：`DimensionInterceptor.afterCompletion()` 调用 `DimensionContext.clear()` 和 `DataSourceContext.clear()`，两者内部均使用 `ThreadLocal.remove()` 彻底删除 `ThreadLocalMap` 中的 Entry，而非 `set(null)`（`set(null)` 只是让 value 引用 null 对象，Entry 本身仍在 map 中，仍占内存）。
+
+`afterCompletion` 即使在 Controller 抛出异常后也会被调用（只要 `preHandle` 返回 true），保证清理一定执行。
+
+---
+
+**Q9：如何保证并发请求下不同维度之间的 ThreadLocal 不互相干扰？**
+
+ThreadLocal 的隔离是线程级别的，每个线程有自己的 `ThreadLocalMap` 副本，线程间完全独立。Tomcat 线程池中，每个 HTTP 请求由独立的线程处理（线程池中取出一个线程），该线程的 ThreadLocal 值与其他线程的值完全隔离，无需加锁。
+
+需要防范的是同一个线程的**时间维度污染**：线程池中的线程被复用，上一个请求结束后如果不清理 ThreadLocal，下一个请求会读到上一个请求的残留值。这就是 `afterCompletion` 必须清理的原因，而不是依赖线程销毁时的清理（线程池中线程不销毁）。
+
+---
+
+**Q10：独有方法的 ExtMapper 和 ExtService 是否可以直接注入 FaultDetailMapper 来复用公共方法？**
+
+可以，但一般不需要。ExtMapper 和 ExtService 的职责是"只处理本维度独有的 1-2 个方法"，如果某个独有方法恰好需要先查一次公共数据再做额外处理，可以在 ExtService 中注入 `FaultDetailService` 调用公共方法，再叠加独有逻辑：
+
+```java
+@Service
+@RequiredArgsConstructor
+public class BetaPerfExtService {
+    private final BetaPerfExtMapper extMapper;
+    private final FaultDetailService faultDetailService; // 可选注入
+
+    public String queryPerfMetrics() {
+        // 只调独有 SQL
+        return extMapper.queryPerfMetrics();
+        // 或叠加公共数据
+        // String base = faultDetailService.queryFaultDetail();
+        // String unique = extMapper.queryPerfMetrics();
+        // return combine(base, unique);
+    }
+}
+```
+
+此时 `DimensionContext` 中的表名已经由拦截器设置，两次 Mapper 调用都会自动路由到 `beta_perf_fault`，无需额外处理。
+
+---
+
+**Q11：如何扩展支持一个新维度（如 gamma_normal）？**
+
+三步，零改动现有代码：
+
+**步骤一**：`application.yml` 添加配置
+```yaml
+gamma_normal:
+  tableName: gamma_normal_fault
+  description: Gamma普通故障
+  # dataSource: gamma  （二期分库时填写）
+```
+
+**步骤二**：新建扩展文件（仅有独有方法时需要）
+```java
+// GammaNormalExtMapper.java
+@Mapper
+public interface GammaNormalExtMapper {
+    String queryGammaNormalUnique();  // 独有 SQL，XML 用 fault_detail 占位
+}
+
+// GammaNormalExtService.java + GammaNormalExtController.java（薄层）
+```
+
+**步骤三**：新建 ExtMapper XML（独有 SQL）
+
+公共 `FaultCommonController`、`FaultDetailService`、`FaultDetailMapper`、`DimensionInterceptor`、`MybatisPlusConfig`——全部零改动。`DimensionManager` 自动从 yml 加载新维度配置。
+
+---
+
+**Q12：DimensionManager 的 @PostConstruct 方法做了什么，为什么需要？**
+
+```java
+@PostConstruct
+public void init() {
+    props.getMappings().forEach((key, config) -> config.setDimensionKey(key));
+    log.info("维度配置加载完成，共 {} 个维度", props.getMappings().size());
+}
+```
+
+Spring Boot 的 `@ConfigurationProperties` 绑定 Map 时，key 不会自动回填到 value 对象的字段中——YAML 的 `beta_normal:` 是 Map 的 key，`DimensionConfig` 的 `dimensionKey` 字段默认为 null。`@PostConstruct` 在 Bean 初始化完成后执行，将 Map key 回填到每个 `DimensionConfig` 实例的 `dimensionKey` 字段，使得后续使用 config 对象时可以直接读取 dimensionKey，便于日志和调试，无需每次反查 Map。
+
+---
+
+**Q13：如果 DimensionContext.getTableName() 返回 null（拦截器未执行），SQL 会怎样？**
+
+`TableNameHandler` 的处理：
+```java
+String dynamic = DimensionContext.getTableName();
+return dynamic != null ? dynamic : tableName;  // null 时返回原占位表名
+```
+
+返回 `fault_detail`（占位表名），SQL 会尝试查询 `fault_detail` 表。若该表不存在，MyBatis 抛出 `Table 'fault_detail' doesn't exist` 异常，通过 `GlobalExceptionHandler` 统一返回错误响应。
+
+这种情况正常使用时不会发生（WebConfig 限定了拦截路径），仅在直接调用内部方法绕过拦截器时才可能出现。改进方案：在 `FaultDetailService` 的入口方法加断言 `Objects.requireNonNull(DimensionContext.getTableName(), "DimensionContext 未初始化")`，将潜在的静默错误转为快速失败的明确异常。
 
 ---
 
@@ -660,50 +583,79 @@ routeMap.put(suffix, bean);  // 后注册的覆盖先注册的
 
 **Q14：AbstractRoutingDataSource 的原理？本项目如何接入？**
 
-`AbstractRoutingDataSource` 是 Spring 提供的抽象数据源，内部维护一个 `Map<Object, DataSource> targetDataSources`（key 为逻辑名，value 为真实数据源）。每次需要连接时，调用 `determineCurrentLookupKey()` 获取 key，再从 map 中找到对应数据源，返回其 `Connection`。
+`AbstractRoutingDataSource` 内部维护 `Map<Object, DataSource> resolvedDataSources`（key 为逻辑名，value 为真实数据源）。每次 MyBatis/Spring 需要数据库连接时，调用 `getConnection()`，其内部调用 `determineTargetDataSource()` → `determineCurrentLookupKey()` 获取 key → 从 map 中找到对应数据源 → 返回其连接。
 
 本项目接入方式：
-1. `DynamicRoutingDataSource` 继承 `AbstractRoutingDataSource`，重写 `determineCurrentLookupKey()` 返回 `DataSourceContext.get()`（从 ThreadLocal 取 key）
-2. `DynamicDataSourceConfig` 中注册 `beta` 和 `comm` 两个真实数据源，调用 `dynamic.setTargetDataSources(map)` 和 `dynamic.afterPropertiesSet()` 完成初始化
-3. `@Primary` 确保 MyBatis 的 `SqlSessionFactory` 注入的是这个动态数据源
-4. `RouteInterceptor` 在请求前向 `DataSourceContext` 写入数据源 key，请求后清理
+1. `DynamicRoutingDataSource` 继承并重写 `determineCurrentLookupKey()` 返回 `DataSourceContext.get()`
+2. `DynamicDataSourceConfig` 注册 `betaDataSource`（HikariCP）和 `commDataSource`（HikariCP），调用 `setTargetDataSources(map)` 和 `afterPropertiesSet()` 初始化
+3. `@Primary` 注解确保 MyBatis 的 `SqlSessionFactory` 注入的是动态数据源
+4. `DimensionInterceptor` 在请求前写入 `DataSourceContext`，请求后清理
 
 ---
 
-**Q15：多数据源下，@Transactional 事务如何保证一致性？**
+**Q15：动态表名 + 动态数据源组合使用时，执行顺序是什么？**
 
-**单库场景（本项目）**：每次请求只操作一个数据源（由 ThreadLocal 决定），`@Transactional` 通过 `DataSourceTransactionManager` 正常工作。Spring 在事务开始时绑定当前线程的数据库连接，事务内的所有操作复用同一连接，ACID 有保障。
+```
+HTTP 请求
+    │
+    ▼ DimensionInterceptor.preHandle()
+      ① DimensionContext.set(dimensionKey, tableName)
+      ② DataSourceContext.set(dataSource)
+    │
+    ▼ Controller → Service → Mapper.queryXxx()
+    │
+    ▼ MyBatis 执行流程：
+      ③ DynamicRoutingDataSource.determineCurrentLookupKey()
+         → DataSourceContext.get() = "beta"
+         → 获取 betaDataSource 的 Connection
+      ④ DynamicTableNameInnerInterceptor.beforeQuery()
+         → 解析 SQL，找到 "fault_detail"
+         → DimensionContext.getTableName() = "normal_fault"（二期）
+         → 替换为 "normal_fault"
+      ⑤ 在 beta 库上执行 SELECT ... FROM normal_fault
+    │
+    ▼ DimensionInterceptor.afterCompletion()
+      ⑥ DimensionContext.clear()
+      ⑦ DataSourceContext.clear()
+```
 
-**注意事项**：`@Transactional` 方法内不能切换数据源（`DataSourceContext.set()` 对事务中已绑定的连接无效），必须在事务开始之前就设置好数据源（本项目拦截器在 Controller 方法执行前已设置，符合要求）。
-
-**跨库场景**：需要分布式事务。选项：
-- Seata AT：基于 undo log，对代码侵入小，性能较好
-- XA 协议：强一致，但性能差，锁时间长
-- TCC：高性能，但需手动实现 try/confirm/cancel 三个方法，开发成本高
-- 最终一致性（消息补偿）：适合允许短暂不一致的业务
+关键点：③ 发生在 ④ 之前——先确定连哪个库，再确定查哪张表，顺序正确且互不干扰。
 
 ---
 
-**Q16：如何让路由支持异步线程（@Async / CompletableFuture）？**
+**Q16：多数据源下，@Transactional 事务如何保证一致性？**
 
-问题：ThreadLocal 不会自动传递给子线程，`@Async` 方法在新线程中执行时，`RouteContext.getModuleName()` 返回 null。
+**单库场景（本项目）**：每次请求只操作一个数据源（由 `DataSourceContext` 决定），`@Transactional` 通过 `DataSourceTransactionManager` 正常工作。Spring 事务开始时绑定当前线程的数据库连接，事务内所有 Mapper 调用复用同一连接，ACID 有保障。
 
-解决方案：
+**关键约束**：数据源必须在事务开始之前设置。本项目中拦截器（`preHandle`）在 Controller/Service 方法执行前就已设置 `DataSourceContext`，符合要求。若在 `@Transactional` 方法内部调用 `DataSourceContext.set()`，事务已绑定旧连接，切换无效。
 
-**方案一**：自定义 `TaskDecorator`，在提交任务时捕获父线程的 ThreadLocal 值，在子线程执行时设置，执行完成后清理：
+**跨库分布式事务**：本项目 beta/comm 数据相互独立，无跨库需求。若有需要，方案选型：Seata AT（低侵入）> TCC（高性能高成本）> 消息最终一致性（允许短暂不一致）。
+
+---
+
+**Q17：如何让路由支持异步线程（@Async / CompletableFuture）？**
+
+问题：子线程无法继承父线程的 ThreadLocal，`@Async` 方法在新线程中执行时 `DimensionContext.getTableName()` 返回 null。
+
+解决方案：自定义 `TaskDecorator`，在任务提交时捕获父线程的上下文，在子线程执行前恢复，执行后清理：
+
 ```java
 @Bean
 public Executor asyncExecutor() {
     ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
     executor.setTaskDecorator(runnable -> {
-        String module = RouteContext.getModuleName();
-        String suffix = RouteContext.getRouteSuffix();
+        // 提交任务时（父线程）捕获上下文
+        String dimensionKey = DimensionContext.getDimensionKey();
+        String tableName    = DimensionContext.getTableName();
+        String dataSource   = DataSourceContext.get();
         return () -> {
             try {
-                RouteContext.setRouteInfo(null, suffix, module);
+                DimensionContext.set(dimensionKey, tableName);
+                if (dataSource != null) DataSourceContext.set(dataSource);
                 runnable.run();
             } finally {
-                RouteContext.clear();
+                DimensionContext.clear();
+                DataSourceContext.clear();
             }
         };
     });
@@ -711,75 +663,67 @@ public Executor asyncExecutor() {
 }
 ```
 
-**方案二**：将路由信息作为参数显式传递给异步方法，而不是依赖 ThreadLocal，适合对路由隔离要求严格的场景。
-
 ---
 
-**Q17：如何实现路由配置的热更新（不重启服务）？**
+**Q18：如何实现维度配置的热更新（不重启服务）？**
 
-当前配置来自 `application.yml`，启动时由 `RouteConfigManager.initRouteConfig()` 加载到 `ConcurrentHashMap`。
+当前配置来自 `application.yml`，由 `DimensionProperties`（`@ConfigurationProperties`）在启动时加载到 `Map`。
 
 热更新方案：
 
-1. **配置中心接入**（推荐）：将路由配置迁移到 Nacos/Apollo，监听配置变更事件，在回调中调用 `RouteConfigManager.clearAllRoutes()` + 重新加载，线程安全（ConcurrentHashMap 的写入是安全的）
+1. **配置中心接入（推荐）**：迁移到 Nacos/Apollo，配置变更时触发 `@RefreshScope`，`DimensionProperties` 重新绑定，`DimensionManager` 的 `@PostConstruct` 重新执行（需将 Manager 也标记为 `@RefreshScope`）
 
-2. **接口触发刷新**：暴露 `/route/reload` 管理端点，接受新的路由配置 JSON，调用 `RouteConfigManager` 的更新方法。需要鉴权保护。
+2. **管理端点触发**：暴露 `/admin/dimension/reload` 接口，接受新的维度配置 JSON，调用 `DimensionManager` 更新内存配置。注意线程安全：`DimensionProperties.mappings` 是普通 HashMap，热更新期间需要加锁或替换为 `ConcurrentHashMap`
 
-3. **`BeanRouteFactory` 的 Bean 路由表无需热更新**：Bean 路由表（serviceRouteMap）的内容是 Spring Bean，Bean 的添加需要重启，热更新的配置只影响 key → `{module, suffix}` 的映射关系。
-
----
-
-**Q18：如何设计路由监控大盘（指标上报）？**
-
-需要监控的关键指标：
-
-| 指标 | 采集方式 |
-|------|---------|
-| 路由分发次数（按 routeKey） | 在 `RouteInterceptor.preHandle` 中 `Counter.increment(routeKey)` |
-| 路由未命中次数（降级到默认路由） | 在 `RouteConfigManager.getRouteConfig` 中计数 |
-| 各路由平均响应时间 | 在 `preHandle` 记录开始时间（写入 ThreadLocal），`afterCompletion` 计算耗时 |
-| 路由错误次数 | 在 `afterCompletion` 检查 `ex != null` 时计数 |
-
-技术选型：Micrometer（Spring Boot Actuator 内置）+ Prometheus 采集 + Grafana 展示。在 `RouteInterceptor` 注入 `MeterRegistry`，使用 `Counter` 和 `Timer` 记录指标，通过 `/actuator/prometheus` 暴露。
+3. **动态表名插件无需热更新**：`DynamicTableNameInnerInterceptor` 的 handler 只是读取 ThreadLocal 值，handler 本身是函数，不依赖配置，无需更新
 
 ---
 
-**Q19：如果要支持读写分离，路由体系如何改造？**
+**Q19：这套方案能支持读写分离吗？如何改造？**
 
-在现有数据源路由体系上叠加读写路由：
+可以，在现有基础上叠加读写标志即可：
 
-1. **`DataSourceContext` 扩展**：从单一 key（如 `beta`）扩展为组合 key（如 `beta-write`、`beta-read`）
-2. **`DynamicDataSourceConfig` 扩展**：注册 4 个数据源：`beta-write`、`beta-read`、`comm-write`、`comm-read`
-3. **读写判断**：在 `RouteInterceptor` 中根据 HTTP Method（GET → read，POST/PUT/DELETE → write）或 AOP 切面分析 `@Transactional(readOnly=true)` 注解，决定向 `DataSourceContext` 写入 `xxx-read` 还是 `xxx-write`
+1. **`DimensionConfig` 扩展**：维持 `dataSource` 字段作为逻辑数据源（如 `beta`），读写由另一维度决定
 
-或者：将读写判断下沉到 `DynamicRoutingDataSource.determineCurrentLookupKey()` 中，读取一个额外的"读写标志" ThreadLocal，组合出最终数据源 key，对上层路由逻辑透明。
+2. **新增读写标志 ThreadLocal**（或扩展 `DataSourceContext`）：
+```java
+// DimensionInterceptor 中
+String rw = "GET".equals(req.getMethod()) ? "read" : "write";
+DataSourceContext.set(config.getDataSource() + "-" + rw);  // 如 "beta-read"
+```
+
+3. **注册 4 个数据源**：`beta-write`、`beta-read`、`comm-write`、`comm-read`（`comm-read` 可指向从库）
+
+4. **`DynamicRoutingDataSource`** 不需要改动，`determineCurrentLookupKey()` 直接返回 `DataSourceContext.get()` 即可（已是组合 key）
 
 ---
 
-**Q20：与多租户（Multi-Tenancy）架构的相通之处？**
+**Q20：与多租户（Multi-Tenancy）架构有什么相通之处？**
 
-本项目的路由体系与多租户架构高度同构：
+本项目的维度路由体系与多租户架构高度同构：
 
 | 概念 | 本项目 | 多租户 |
 |------|-------|-------|
-| 路由 key | `beta_fault`、`comm_fault` | 租户 ID（如 `tenant_001`）|
-| 路由上下文 | `RouteContext`（ThreadLocal）| 租户上下文（ThreadLocal）|
-| 数据源切换 | `DataSourceContext` | 租户数据源（每租户一个 DB）|
-| 路由规则来源 | URL 路径 | HTTP Header（`X-Tenant-Id`）、JWT token |
+| 路由标识 | dimensionKey（`beta_normal`） | 租户 ID（`tenant_001`） |
+| 路由上下文 | `DimensionContext`（ThreadLocal）| 租户上下文（ThreadLocal）|
+| 数据源切换 | `DataSourceContext` → `DynamicRoutingDataSource` | 租户数据源（每租户一个 DB）|
+| 表名路由 | `DynamicTableNameInnerInterceptor` | 同 schema 下按租户前缀区分表 |
+| 路由来源 | URL 路径（`/{module}/{domain}/...`） | HTTP Header（`X-Tenant-Id`）或 JWT |
 
-本项目的 `RouteInterceptor` 改造为多租户拦截器只需：从 Header 中提取租户 ID 替代从 URL 提取 routeKey；其余 ThreadLocal 管理、数据源切换的机制完全复用。
+`DimensionInterceptor` 改造为多租户拦截器只需从 Header 读取租户 ID 替代从 URL 提取 dimensionKey，其余 ThreadLocal 管理、数据源切换、动态表名机制完全复用。
 
 ---
 
-**Q21：如何防止路由错误（比如误用了生产数据源）？**
+**Q21：如何防止动态表名被恶意构造导致安全问题？**
 
-多层防护策略：
+`DynamicTableNameInnerInterceptor` 本身已规避 SQL 注入（在 SQL 语法解析层替换，非字符串拼接），但仍需防止路由到非预期的表。
 
-1. **配置层校验**：`RouteConfigManager.validateConfig()` 启动时检查路由配置完整性；严格模式下路由 key 不存在直接抛异常
-2. **数据源 key 白名单**：在 `DynamicDataSourceConfig` 中明确注册 key，`determineCurrentLookupKey()` 返回未知 key 时，`AbstractRoutingDataSource` 会使用默认数据源并打日志
-3. **环境隔离**：通过 Spring Profile（`application-prod.yml`、`application-test.yml`）管理不同环境的数据源 URL，防止测试配置文件中出现生产 URL
-4. **权限控制**：生产数据库账号仅有 SELECT 权限，即使路由到生产数据源也无法写入
-5. **Canary 测试**：新增路由配置后，先在测试环境验证，并通过接口测试断言返回数据来源
+防护措施：
+
+1. **白名单校验**：`DimensionManager.getConfig()` 只返回 yml 中预注册的维度配置，dimensionKey 来自受控的 Map 查找，不接受用户直接输入
+2. **tableName 来源可信**：tableName 完全由配置文件决定（`DimensionConfig.tableName`），用户无法通过请求参数影响
+3. **维度 key 提取来自 URL 路径段**：`parts[1] + "_" + parts[2]`，例如 `beta_normal`，即使路径被篡改为 `beta_normal; DROP TABLE`，`DimensionManager` 找不到该 key 会降级到默认维度，不会执行恶意 SQL
+4. **数据库账号权限最小化**：只授予业务查询所需的 SELECT/INSERT 权限，即使路由到错误的表也无法执行 DDL
 
 ---
 
@@ -787,97 +731,80 @@ public Executor asyncExecutor() {
 
 **Q22：与 ShardingSphere 分库分表方案相比，各自适合什么场景？**
 
-**本项目方案**适合：
-- 数据库实例数量少（2-10 个），每个实例包含完整业务数据
-- 路由规则基于业务语义（环境、租户），而非数据分片键
-- 团队希望保留对路由逻辑的完全控制，避免引入大型中间件
-- 无分布式事务需求
+| 维度 | 本项目方案 | ShardingSphere |
+|------|-----------|----------------|
+| 路由粒度 | 按业务维度（beta/comm × 领域）路由 | 按数据分片键（用户 ID、时间）路由 |
+| 数据库数量 | 少（2 个） | 大规模（数十至数百个分片） |
+| 引入成本 | 极低（Spring 原生 + MyBatis-Plus 内置插件）| 需引入 shardingsphere-jdbc 或独立 Proxy 进程 |
+| 动态表名 | 业务语义驱动，表结构完全相同 | 分片表按规则命名（`order_0`~`order_15`）|
+| 事务支持 | 单库 @Transactional 即可 | 内置 XA/BASE 分布式事务 |
+| 学习/运维成本 | 低 | 高（SQL 方言限制、分片规则调试）|
 
-**ShardingSphere**适合：
-- 单表数据量超过千万级，需要水平分片降低单库压力
-- 路由规则基于数据特征（用户 ID 取模、时间范围）
-- 需要内置读写分离、SQL 解析、数据加密等企业级功能
-- 团队有 DBA 资源维护分片配置
-
-两者可以组合：用本项目的路由体系做**业务路由**（选数据库实例），用 ShardingSphere 在实例内部做**数据路由**（选分片表）。
+**结论**：业务维度数量少（6 个）、表结构同构、无水平分片需求时，本项目方案是最合适的选择，零外部依赖。ShardingSphere 适合单表行数超过千万级、需要水平分片降低单库压力的场景，在本项目中属于过度设计。
 
 ---
 
-**Q23：初版设计（if-else）和现版设计的对比，为什么做出改变？**
+**Q23：初版（if-else）→ 中间状态（Bean 路由）→ 最终方案（动态表名）的演进，为什么做这两次改变？**
 
-| 维度 | if-else 方案 | 当前方案 |
-|------|------------|---------|
-| 扩展新环境 | 修改所有业务方法 | 只新增一个类 + 配置一行 |
-| 代码行数 | 随环境数量线性增长 | 不增长 |
-| 测试难度 | 需覆盖所有分支 | 路由逻辑和业务逻辑可独立测试 |
-| 配置灵活性 | 需改代码并重新部署 | 修改 yml 即可（可接入配置中心实现热更新）|
-| 可读性 | 业务方法中混杂路由判断 | 各层职责单一，清晰 |
+| 版本 | 方案 | 问题 | 改变原因 |
+|------|------|------|---------|
+| v1 | if-else 判断 | 业务方法混杂路由判断，新增维度全局改 | 关注点未分离 |
+| v2 | Bean 路由（BeanRouteFactory + @RouteCustom）| 路由判断解耦了，但 6 套 Bean 仍然存在，重复没有减少 | 解决了错误的问题 |
+| v3 | 动态表名路由 | — | 识别到"表结构相同、差异仅表名"这一本质，选择匹配问题本质的工具 |
 
-改变的驱动力：项目初期只有 beta/comm 两个环境，if-else 可以接受。当需求变为"支持任意数量的业务环境，且不同环境的接入频率可能很高"时，if-else 的维护成本呈现出明显的增长趋势，重构的 ROI 为正。
+v2 → v3 是认知升级：v2 把问题定义为"如何分发到不同的 Bean"，v3 把问题重新定义为"如何路由到不同的表"。问题定义正确后，解决方案自然简单。
 
 ---
 
-**Q24：这套方案的性能瓶颈在哪里？如何评估 QPS 上限？**
+**Q24：这套方案的性能瓶颈在哪里？**
 
-性能分析：
-
-| 环节 | 开销 | 备注 |
+| 环节 | 开销 | 说明 |
 |------|------|------|
-| URL 路径解析 | 极低，O(路径段数) | 字符串 split，通常 3-5 段 |
-| ConcurrentHashMap 查找 | O(1) | 两次 map.get() |
-| ThreadLocal 读写 | 极低 | 本质是数组索引 + hash 查找 |
-| 数据源获取（多数据源） | 低 | AbstractRoutingDataSource 一次 map 查找 |
+| URI 路径解析 | 极低，O(路径段数) | 字符串 split，通常 3-5 段 |
+| Map 配置查找 | O(1) | `DimensionManager` 内存 HashMap |
+| ThreadLocal 读写 | 极低 | 数组索引 + hash 查找，纳秒级 |
+| JSqlParser SQL 解析 | 低，毫秒级 | `DynamicTableNameInnerInterceptor` 的主要开销 |
+| 数据源查找（二期） | 极低 | `AbstractRoutingDataSource` 一次 Map 查找 |
 
-**瓶颈不在路由框架本身**，路由层的额外开销单次请求约在微秒级。真正的 QPS 瓶颈在于：
-- **数据库连接池**：HikariCP 连接数、等待超时配置
-- **SQL 执行时间**：目标表的索引设计
-- **线程池大小**：Tomcat 的 `server.tomcat.threads.max`
-
-评估方式：用 JMeter / k6 对 `/fault/distribution/beta_fault` 施压，观察 P99 响应时间和 TPS，对比有/无路由拦截器时的差异（通常 < 0.1ms，可忽略）。
+真正的瓶颈在路由框架之外：数据库连接池（HikariCP 等待时间）、SQL 执行时间（目标表索引设计）、Tomcat 线程池大小。路由层额外开销约在 1ms 以内，可忽略不计。
 
 ---
 
-**Q25：如果数据量从 4 个环境扩展到 200 个租户，方案会面临什么挑战？**
+**Q25：如果维度数量从 6 个扩展到 200 个（类多租户场景），方案会面临什么挑战？**
 
-**Bean 路由表规模**：200 个 ServiceImpl × 200 个 MapperImpl，启动时扫描和注册耗时增加，但总量仍在可接受范围（几百个 Bean）。
+**当前方案的局限**：
+1. **连接池压力（二期）**：200 个数据源 × 最小连接数（10）= 2000 个长连接，对数据库端口和内存压力极大
+2. **扩展文件数量**：200 × 3 个扩展文件（ExtMapper + ExtService + ExtController）= 600 个文件，虽然每个极薄，但文件数量可观
+3. **配置文件膨胀**：200 行 yml 配置，可读性下降
 
-**数据源连接池压力**：200 个数据源 × 每个数据源最少 10 个连接 = 2000 个数据库连接，对数据库端口和内存都是极大压力。
-
-**解决方案**：
-1. **连接池共享**：同一数据库实例的多个租户共享连接池，在 SQL 层通过 schema 切换（`USE tenant_xxx`）或行级租户隔离（每张表加 `tenant_id` 列）
-2. **懒加载数据源**：按需初始化数据源，而非启动时全部创建
-3. **ShardingSphere 接管**：此时 ShardingSphere 的多租户方案更成熟，本项目方案属于过度自研
-
-**本质问题**：本方案的"一个路由对应一个数据源"模式，在租户数量级别需要转向"多租户共享数据源 + 行级隔离"或"连接池复用 + Schema 切换"。
+**解决方向**：
+1. **连接池共享**：beta/comm 各一个连接池，同一个库内的多维度共享连接（一期方案本已如此，不受影响）
+2. **配置中心**：yml 迁移到 Nacos，支持动态维护和热更新
+3. **代码生成**：扩展文件规律性极强，可用代码生成器一键生成
+4. **行级租户隔离（彻底方案）**：6 张表合并为 1 张，加 `dimension_key` 列，SQL 自动追加 `WHERE dimension_key = ?`，彻底消除扩展文件需求
 
 ---
 
-**Q26：有没有考虑用 MyBatis Plugin（Interceptor）方案替代？为什么没有选？**
+**Q26：有没有考虑通过 MyBatis 的 `Interceptor`（Plugin）实现动态表名，而不是用 MyBatis-Plus 的 `DynamicTableNameInnerInterceptor`？**
 
-MyBatis Plugin 方案的思路：在 `Executor`/`StatementHandler` 的 `intercept()` 中，根据当前上下文动态修改 `MappedStatement` 的 SQL 或动态切换数据源。
+有考虑。自定义 MyBatis `Interceptor` 同样可以拦截 `Executor.query()`，解析 SQL 替换表名。没有选择的原因：
 
-**没有选的原因**：
+1. **已有现成方案**：MyBatis-Plus 的 `DynamicTableNameInnerInterceptor` 已内置 JSqlParser 解析逻辑，无需重复实现
+2. **避免插件链冲突**：MyBatis-Plus 的 `MybatisPlusInterceptor` 是插件总线，内置 `InnerInterceptor` 在其内部有序执行；额外引入自定义 MyBatis `Interceptor` 会在外层再包一层，执行顺序和边界更难控制
+3. **维护成本**：`DynamicTableNameInnerInterceptor` 经过生产验证，自研实现需要处理各种 SQL 方言（子查询、JOIN、IN 子句等），维护成本高
 
-1. **职责错位**：MyBatis Plugin 的设计目标是 SQL 层面的增强（分页、性能分析），用来做路由是职责错位，代码难以理解和维护
-2. **耦合过深**：需要在 MyBatis 内部解析业务路由逻辑，与框架实现细节深度耦合
-3. **灵活性差**：路由规则需要在 SQL 执行层判断，而路由 key 来自 HTTP 请求，需要通过 ThreadLocal 传递，并没有比现有方案简单
-4. **调试困难**：Plugin 链的执行顺序和异常处理比 Spring 拦截器复杂得多
-5. **现有方案已经足够**：`AbstractRoutingDataSource` 在 JDBC 连接层切换数据源，已是足够底层的解决方案，不需要再深入到 SQL 层
-
-MyBatis Plugin 更适合的场景：动态表名（分表场景下将 `fault_detail` 改为 `fault_detail_202501`）、SQL 性能分析、数据脱敏。
+自定义 MyBatis Plugin 更适合的场景：SQL 性能分析（打印慢 SQL）、全字段加密脱敏、特殊 SQL 改写（MyBatis-Plus 内置插件不支持的场景）。
 
 ---
 
 **Q27：反思这个项目的设计，有什么地方还可以做得更好？**
 
-1. **路由表重复注册检测不够严格**：当前是 warn 日志 + 覆盖，应该在严格模式下抛出启动异常，而不是运行时静默覆盖，因为重复注册几乎肯定是配置错误
+1. **`FaultDetailMapper.xml` 中的 demo SQL 不够真实**：当前 SQL 查的是 `information_schema.TABLES`，实际项目中应查业务表字段。当前 SQL 的 `WHERE table_name = 'fault_detail'` 是静态字符串查询，`DynamicTableNameInnerInterceptor` 替换的是 FROM 子句中的表名，不会替换 WHERE 条件中的字符串值——需要注意两者的区别，避免在真实 SQL 中产生混淆
 
-2. **`BeanRouteFactory` 耦合了具体接口类型**：`determineBeanType()` 方法中硬编码了 `IBaseFaultDetailService` 和 `BaseFaultDetailRouterMapper`，未来新增业务模块需要修改工厂。改进：用接口标记（如 `IRoutable` 接口）替代 `instanceof` 判断，工厂对具体业务类型无感知
+2. **ExtMapper 独立于 FaultDetailMapper，但 @TableName 关联仍依赖约定**：ExtMapper 是普通接口（未继承 `BaseMapper`），XML 中手写 `FROM fault_detail` 依赖开发者知道"占位表名是 fault_detail"这一约定。建议在团队规范文档中明确标注，或封装常量 `DimensionContext.PLACEHOLDER_TABLE = "fault_detail"` 供 XML 引用时参考（XML 本身无法引用 Java 常量，但可以写在注释中）
 
-3. **`BeanRouteFactory` 的 `routeConfigManager` 字段未注入**：代码中声明了 `private RouteConfigManager routeConfigManager`，但没有通过构造器注入，实际使用 `getMapperByRoute` 会 NPE。这是一个需要修复的 bug（`getServiceFromContext` / `getMapperFromContext` 路径不受影响）
+3. **`DimensionManager` 未做配置完整性校验**：启动时只打 info 日志，未校验 `tableName` 是否为空、`defaultKey` 是否在 mappings 中存在。建议在 `@PostConstruct` 中加入断言，启动时快速失败而非运行时才暴露问题
 
-4. **`RouteConfigProperties` 的 `enabled` 字段处理有 bug**：`RouteConfigManager.getRouteConfig()` 中 `Objects.requireNonNull(config).getEnabled()` 当 `enabled=true` 时 `getEnabled()` 返回 `true`，但 `if (!config.getEnabled())` 的判断不会进入，逻辑正确；但当 `enabled` 字段未配置（null）时，`isEnabled()` 返回 false，会误判为禁用，而 `!Objects.requireNonNull(config).getEnabled()` 会 NPE，存在防御不足
+4. **异步场景未处理**：`@Async` 方法中 ThreadLocal 不自动传播，当前代码未提供 `TaskDecorator`。在服务中引入异步处理时需要补充，否则会出现 `DimensionContext.getTableName() = null` 的静默错误
 
-5. **缺少路由健康检查端点**：生产环境应该暴露 `/actuator/route-health`，展示当前已注册的所有路由、对应的 Bean 实例、最近路由命中次数，方便运维排查问题
-
-6. **异步场景未处理**：ThreadLocal 不自动传播到子线程，`@Async` 方法会丢失路由上下文，需要通过 `TaskDecorator` 解决（见 Q16）
+5. **缺少监控端点**：生产环境建议暴露 `/actuator/dimensions`，展示当前已注册的所有维度配置、各维度请求计数、最近错误次数，方便排查路由问题
