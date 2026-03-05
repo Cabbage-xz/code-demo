@@ -14,6 +14,36 @@
 
 **一句话概括**：设计并落地了一套**基于 PowerJob + RocketMQ 的故障日志每日全量同步流水线**：采用 rank 游标翻页消除深翻页性能陷阱、MQ 异步解耦拉取与写库、各领域独立 PowerJob 定时任务并发调度，DB 写入吞吐从逐条串行的 800 条/秒提升至批量入库的 4 万条/秒（提升 50 倍），单领域每日同步全链路由同步串行方案的约 17 分钟压缩至约 2 分钟，支撑 20 个领域每日数百万条故障记录的 SLA。
 
+### 完整口述版（2-3 分钟 · 面向技术面试官）
+
+---
+
+"我来介绍一个我参与设计并落地的**故障数据每日全量同步系统**。
+
+**业务背景**：公司的设备管理平台每天需要把各业务领域的设备故障日志从上游数据源同步到本地 MySQL，供质检和运维团队做故障分析和告警。核心挑战有三：上游接口单次最多返回 5000 条，必须分页拉取；顶峰期单领域单日数据量可达百万级；上游数据存在最长 5 天的延迟更新，所以每天要对最近 5 天全部重同步一遍。
+
+**技术选型**：整体采用 PowerJob + RocketMQ + MySQL 的架构。PowerJob 负责定时调度和任务级重试，RocketMQ 作为拉取和写库之间的缓冲解耦层，MyBatis-Plus 负责批量写入。
+
+**核心设计，我重点讲四个决策：**
+
+第一，**翻页策略选 rank 游标**。最直觉的 offset 分页在百万级数据下会退化成全表扫描，第 200 页的耗时从 50ms 增长到 8 秒以上。改用 rank 游标后，每批请求走索引范围扫描，耗时恒定在 50-80ms，200 批总拉取时间从约 27 分钟压缩到约 16 秒。
+
+第二，**MQ 异步解耦拉取与写库**。拉完直接写库会导致 DB 压力峰值和线程阻塞。每批 5000 条封装成一条 MQ 消息，Consumer 做批量 INSERT IGNORE，DB 写入吞吐从逐条的约 800 条/秒提升到约 4 万条/秒，提升 50 倍。消费失败自动重试 3 次，超限进死信队列，DLQ Consumer 负责告警和标记任务失败。
+
+第三，**各领域独立 PowerJob 任务**。没有做一个大任务处理所有 20 个领域，而是每个领域配置独立的定时任务，共用一个通用处理器，通过 instanceParams 传入领域名称。这样失败隔离粒度到领域级，每个领域可以独立配置 cron、超时和重试策略。处理器内部用 CompletableFuture + 共享有界线程池并发执行 5 个日期任务，CallerRunsPolicy 在多域任务并发争抢线程池时自然产生背压。
+
+第四，**幂等双保险**。主策略是每次同步前先 DELETE 该 domain+date 的旧数据再全量插入，天然幂等支持任意重跑。安全兜底是 fault_record 上的联合唯一索引 `(domain, data_date, rank)` + INSERT IGNORE，防止 MQ 消息重投时重复写入。
+
+**进度跟踪**：设计了 sync_task_record 表，状态机为 PENDING → RUNNING → MESSAGES_SENT → SUCCESS / FAILED。MESSAGES_SENT 是关键哨兵状态，表示生产侧已完成、消费侧正在追；Consumer 每消费完一批用一条原子 UPDATE + CASE WHEN SQL 推进计数，全部消费完自动翻到 SUCCESS，不依赖分布式锁。
+
+**量化结果**：正常场景（约 2 万条/域/天）单领域全链路约 2 分钟完成，20 个领域并发约 2 分钟内全部到达 SUCCESS，每日同步约 200 万条数据。顶峰场景（百万级/域/天）约 15-20 分钟，相比原串行方案预估的 6+ 小时缩短了 95% 以上。
+
+这个项目让我对**批处理管道设计、MQ 可靠性保障、幂等设计，以及如何在高吞吐和可靠性之间做工程权衡**有了比较深入的实践理解。"
+
+---
+
+### 精简要点版（面试时分点阐述）
+
 ---
 
 "我来介绍一个我参与设计并落地的**故障数据每日同步系统**。
@@ -284,6 +314,91 @@ MQ 消费失败自动重试 3 次，超限进 DLQ，DLQ Consumer 将 sync_task_r
   │  DELETE+INSERT IGNORE │  幂等兜底，任意次重跑正确     │  短暂空窗口可接受 │
   └───────────────────────┴──────────────────────────────┴───────────────────┘
 ```
+
+---
+
+### sync_task_record 状态机详解
+
+每个 `(domain, data_date)` 组合对应 sync_task_record 表中的一行，贯穿同步任务的完整生命周期。
+
+#### 状态转换图
+
+```
+                          任务首次触发
+                               │
+                               ▼
+                          ┌─────────┐
+                          │ PENDING │  记录已创建，等待执行
+                          └────┬────┘
+                               │  syncDomainDate() 开始 → DELETE 执行完毕
+                               ▼
+                          ┌─────────┐
+                          │ RUNNING │  DELETE 已完成，rank游标拉取循环进行中
+                          └────┬────┘
+                    ┌──────────┴──────────┐
+          pull/send 全部完成           pull() 抛出异常
+          batchCount 记录完毕          或 sendBatch 失败
+                    │                       │
+                    ▼                       ▼
+           ┌──────────────┐           ┌────────┐
+           │ MESSAGES_SENT│           │ FAILED │ ←─── DLQ Consumer 也会
+           │ batchCount=N │           │        │      直接写入此状态
+           └──────┬───────┘           └────────┘
+                  │  Consumer 每消费完一批：
+                  │  completed_batch_count + 1
+                  │  CASE WHEN completed+1 >= N → SUCCESS
+                  │
+                  ├─ completed < N  →  保持 MESSAGES_SENT，继续等待
+                  │
+                  └─ completed == N
+                               │
+                               ▼
+                          ┌─────────┐
+                          │ SUCCESS │  所有批次消费完毕，数据完整入库
+                          └─────────┘
+```
+
+#### 各状态含义与设计考量
+
+| 状态 | 含义 | 触发时机 | 设计意图 |
+|------|------|---------|---------|
+| PENDING | 任务记录已初始化 | syncDomainDate() 入口 upsert | 幂等创建，重跑时不报错 |
+| RUNNING | 生产侧正在执行 | DELETE 完成后立即设置 | 标记空窗口开始；监控可感知正在执行 |
+| MESSAGES_SENT | 生产侧完成，等待消费侧 | pull 循环结束，batchCount 写入 | 关键哨兵：Consumer 的 incrementCompletedBatch WHERE status='MESSAGES_SENT' 依赖此状态；FAILED 后此条件不再匹配，防止幽灵计数 |
+| SUCCESS | 全部批次消费写库完成 | completed_batch_count == batchCount 时原子翻转 | 终态，表示数据完整可用 |
+| FAILED | 生产侧报错或消费侧进 DLQ | pull 异常 catch / DLQ Consumer | 告警出口；PowerJob 重跑时 DELETE + 状态重置 |
+
+#### 关键 SQL：incrementCompletedBatch
+
+```sql
+UPDATE sync_task_record
+SET completed_batch_count = completed_batch_count + 1,
+    status = CASE
+               WHEN completed_batch_count + 1 >= #{batchCount} THEN 'SUCCESS'
+               ELSE status
+             END,
+    end_time = CASE
+                 WHEN completed_batch_count + 1 >= #{batchCount} THEN NOW()
+                 ELSE end_time
+               END
+WHERE domain = #{domain}
+  AND data_date = #{dataDate}
+  AND status = 'MESSAGES_SENT'
+```
+
+**为什么这样设计：**
+1. **原子性**：`completed_batch_count + 1` 在 DB 层计算，不是先 SELECT 再 UPDATE，MySQL 行锁保证多个 Consumer 并发时串行化，无需应用层锁
+2. **防幽灵计数**：`WHERE status='MESSAGES_SENT'` 保证只有在正常流程中才推进计数；一旦状态变为 FAILED（DLQ 触发），后续 Consumer 的 UPDATE 影响行数为 0，不会意外将失败任务变成 SUCCESS
+3. **自动终态**：CASE WHEN 在同一条 SQL 内完成 SUCCESS 的翻转，无需额外的状态更新请求
+
+#### 状态机与故障场景的对应关系
+
+| 故障场景 | 最终状态 | completed_batch_count | 原因 |
+|---------|---------|----------------------|------|
+| 正常完成 | SUCCESS | == batchCount | 所有批次消费完毕 |
+| 拉取阶段报错 | FAILED | 0（或部分值，但无意义） | MESSAGES_SENT 未设置，WHERE 不匹配，计数不推进 |
+| 消费侧入库失败进 DLQ | FAILED | < batchCount | DLQ Consumer 强制置 FAILED；其余批次的 increment 因 WHERE 不匹配而停止 |
+| PowerJob 任务重跑 | 重置为 RUNNING | 0 | DELETE 清理数据，状态机重新走一遍 |
 
 ---
 
