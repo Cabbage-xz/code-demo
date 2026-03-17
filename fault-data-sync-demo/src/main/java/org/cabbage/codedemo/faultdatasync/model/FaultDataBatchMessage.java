@@ -31,6 +31,9 @@ public class FaultDataBatchMessage implements Serializable {
     /** 批次序号（从 0 开始） */
     private int batchIndex;
 
+    /** 本批 pull 的起始 rank，便于 consumer 更新 SyncBatchRecord */
+    private long startRank;
+
     /** 本批次故障记录列表（最多 5000 条） */
     private List<FaultRecordDTO> records;
 }

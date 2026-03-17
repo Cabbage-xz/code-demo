@@ -74,17 +74,19 @@ A daily batch synchronization pipeline that pulls device-reported fault logs fro
 **Key Features**:
 - rank-based cursor pagination against upstream API (5,000 records per page)
 - 20 domains processed in parallel via a bounded thread pool (CallerRunsPolicy back-pressure)
-- Full-overwrite resync strategy (DELETE then INSERT) for D-1 through D-5
-- Layered idempotency: full overwrite as primary + INSERT IGNORE + unique index as safety net
-- MQ retry (maxReconsumeTimes=3) → DLQ → FAILED marking and alert hook
-- Atomic batch-completion tracking via a single `UPDATE … CASE WHEN` SQL
+- Two-path sync strategy: first run = full DELETE + pull; retry run = batch-level re-pull of failed batches only (no DELETE)
+- Batch-level failure tracking via `sync_batch_record` (pull_status + insert_status per batch)
+- Layered idempotency: full overwrite on first run + INSERT IGNORE + unique index `(domain, data_date, rank)`
+- MQ retry (maxReconsumeTimes=3) → DLQ → `markInsertFailed` + FAILED marking and alert hook
+- Race-condition-safe batch-completion tracking: `UPDATE … CASE WHEN` with `WHERE status IN ('RUNNING','MESSAGES_SENT') AND batch_count > 0`
 - Configurable mock data source for local testing (up to 1,000,000 records per domain/date)
 
 **Main Components**:
-- FaultDataSyncJob: PowerJob BasicProcessor, orchestrates parallel CompletableFuture tasks
-- FaultSyncServiceImpl: core loop (delete → pull → MQ send)
-- FaultDataConsumer: INSERT IGNORE in 1,000-row chunks, increments completed-batch counter
-- FaultDataDlqConsumer: DLQ consumer, marks task FAILED, extendable alerting hook
+- FaultDataSyncJob: PowerJob BasicProcessor, orchestrates per-domain CompletableFuture tasks
+- FaultSyncServiceImpl: first-run path (`runFirstSync`: DELETE → pull loop) and retry path (`runRetrySync`: re-pull only sync_batch_record FAILED rows)
+- SyncBatchRecordServiceImpl: per-batch pull/insert status lifecycle (`markPullSuccess/Failed`, `markInsertSuccess/Failed`)
+- FaultDataConsumer: INSERT IGNORE in 1,000-row chunks, `markInsertSuccess`, increments completed-batch counter
+- FaultDataDlqConsumer: DLQ consumer, `markInsertFailed` + marks task FAILED, extendable alerting hook
 - MockFaultDataSourceClient: rank-cursor mock, configurable total volume
 
 ---

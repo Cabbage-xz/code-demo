@@ -5,6 +5,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.rocketmq.spring.annotation.RocketMQMessageListener;
 import org.apache.rocketmq.spring.core.RocketMQListener;
 import org.cabbage.codedemo.faultdatasync.model.FaultDataBatchMessage;
+import org.cabbage.codedemo.faultdatasync.service.SyncBatchRecordService;
 import org.cabbage.codedemo.faultdatasync.service.SyncTaskRecordService;
 import org.springframework.stereotype.Component;
 
@@ -30,6 +31,7 @@ import org.springframework.stereotype.Component;
 public class FaultDataDlqConsumer implements RocketMQListener<FaultDataBatchMessage> {
 
     private final SyncTaskRecordService syncTaskRecordService;
+    private final SyncBatchRecordService syncBatchRecordService;
 
     @Override
     public void onMessage(FaultDataBatchMessage msg) {
@@ -40,7 +42,11 @@ public class FaultDataDlqConsumer implements RocketMQListener<FaultDataBatchMess
 
         log.error("[DLQ] {}", errorMsg);
 
-        // 标记同步任务失败
+        // 批次级标记：仅该批次 insert_status=FAILED，保留其他批次数据
+        syncBatchRecordService.markInsertFailed(
+                msg.getDomain(), msg.getDataDate(), msg.getBatchIndex(), errorMsg);
+
+        // 任务级标记 FAILED，触发 PowerJob 重试；重试时 hasSuccessBatch()=true，走重试路径
         syncTaskRecordService.updateFailed(msg.getDomain(), msg.getDataDate(), errorMsg);
 
         // TODO: 接入告警系统（钉钉/邮件/PagerDuty）

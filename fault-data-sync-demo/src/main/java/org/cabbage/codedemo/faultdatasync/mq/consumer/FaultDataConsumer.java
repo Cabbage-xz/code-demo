@@ -8,6 +8,7 @@ import org.apache.rocketmq.spring.core.RocketMQListener;
 import org.cabbage.codedemo.faultdatasync.entity.FaultRecordEntity;
 import org.cabbage.codedemo.faultdatasync.mapper.FaultRecordMapper;
 import org.cabbage.codedemo.faultdatasync.model.FaultDataBatchMessage;
+import org.cabbage.codedemo.faultdatasync.service.SyncBatchRecordService;
 import org.cabbage.codedemo.faultdatasync.service.SyncTaskRecordService;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
@@ -35,6 +36,7 @@ public class FaultDataConsumer implements RocketMQListener<FaultDataBatchMessage
 
     private final FaultRecordMapper faultRecordMapper;
     private final SyncTaskRecordService syncTaskRecordService;
+    private final SyncBatchRecordService syncBatchRecordService;
 
     @Value("${fault-sync.batch-size:1000}")
     private int dbBatchSize;
@@ -54,6 +56,9 @@ public class FaultDataConsumer implements RocketMQListener<FaultDataBatchMessage
 
         log.info("[Consumer] domain={} date={} batchIndex={} 写入完成，共 {} 条",
                 msg.getDomain(), msg.getDataDate(), msg.getBatchIndex(), entities.size());
+
+        // 更新批次入库状态
+        syncBatchRecordService.markInsertSuccess(msg.getDomain(), msg.getDataDate(), msg.getBatchIndex());
 
         // 通知进度跟踪：已完成批次 +1，若全部完成则自动置为 SUCCESS
         syncTaskRecordService.incrementCompletedBatch(msg.getDomain(), msg.getDataDate());

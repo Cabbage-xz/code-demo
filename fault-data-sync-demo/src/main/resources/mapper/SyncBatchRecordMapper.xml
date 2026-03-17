@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.cabbage.codedemo.faultdatasync.mapper.SyncBatchRecordMapper">
+
+    <insert id="upsertPullSuccess">
+        INSERT INTO sync_batch_record
+            (domain, data_date, batch_index, start_rank, end_rank, record_count,
+             pull_status, insert_status, create_time, update_time)
+        VALUES
+            (#{domain}, #{dataDate}, #{batchIndex}, #{startRank}, #{endRank}, #{recordCount},
+             'SUCCESS', 'PENDING', NOW(), NOW())
+        ON DUPLICATE KEY UPDATE
+            end_rank      = VALUES(end_rank),
+            record_count  = VALUES(record_count),
+            pull_status   = 'SUCCESS',
+            insert_status = 'PENDING',
+            error_message = NULL,
+            update_time   = NOW()
+    </insert>
+
+    <select id="findFailed" resultType="org.cabbage.codedemo.faultdatasync.entity.SyncBatchRecordEntity">
+        SELECT *
+        FROM sync_batch_record
+        WHERE domain    = #{domain}
+          AND data_date = #{dataDate}
+          AND (pull_status = 'FAILED' OR insert_status = 'FAILED')
+        ORDER BY batch_index
+    </select>
+
+</mapper>

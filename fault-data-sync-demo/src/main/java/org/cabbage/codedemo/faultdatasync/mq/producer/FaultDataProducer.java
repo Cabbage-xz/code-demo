@@ -3,9 +3,11 @@ package org.cabbage.codedemo.faultdatasync.mq.producer;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.rocketmq.spring.core.RocketMQTemplate;
+import org.apache.rocketmq.spring.support.RocketMQHeaders;
 import org.cabbage.codedemo.faultdatasync.model.FaultDataBatchMessage;
 import org.cabbage.codedemo.faultdatasync.model.FaultRecordDTO;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.messaging.support.MessageBuilder;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDate;
@@ -32,21 +34,25 @@ public class FaultDataProducer {
      * @param domain     数据领域
      * @param dataDate   数据所属日期
      * @param batchIndex 批次序号（从 0 开始）
+     * @param startRank  本批 pull 的起始 rank
      * @param records    本批次记录列表
      */
-    public void sendBatch(String domain, LocalDate dataDate, int batchIndex, List<FaultRecordDTO> records) {
+    public void sendBatch(String domain, LocalDate dataDate, int batchIndex,
+                          long startRank, List<FaultRecordDTO> records) {
         FaultDataBatchMessage message = FaultDataBatchMessage.builder()
                 .domain(domain)
                 .dataDate(dataDate)
                 .batchIndex(batchIndex)
+                .startRank(startRank)
                 .records(records)
                 .build();
 
-        // 使用 domain+date 作为 MessageKey，便于消息追踪
         String messageKey = domain + "_" + dataDate + "_" + batchIndex;
-        rocketMQTemplate.syncSend(topic, message);
+        rocketMQTemplate.syncSend(topic, MessageBuilder.withPayload(message)
+                .setHeader(RocketMQHeaders.KEYS, messageKey)
+                .build());
 
-        log.info("[Producer] 发送消息 topic={} key={} batchIndex={} records={}",
-                topic, messageKey, batchIndex, records.size());
+        log.info("[Producer] 发送消息 topic={} key={} batchIndex={} startRank={} records={}",
+                topic, messageKey, batchIndex, startRank, records.size());
     }
 }

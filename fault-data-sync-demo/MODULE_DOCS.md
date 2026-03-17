@@ -41,14 +41,27 @@ FaultDataSyncJob.process()
         │   [each date task] FaultSyncServiceImpl.syncDomainDate(domain, date)
         │           │
         │           ├── 1. sync_task_record → RUNNING
-        │           ├── 2. DELETE fault_record WHERE domain=? AND data_date=?
-        │           ├── 3. loop:
-        │           │     a. pull(domain, date, lastRank, 5000) from data source
-        │           │     b. wrap as FaultDataBatchMessage
-        │           │     c. FaultDataProducer.sendBatch(...)
-        │           │     d. lastRank = max(response[].rank)
-        │           │     e. if response.size < 5000 → break
-        │           └── 4. sync_task_record → MESSAGES_SENT (batchCount recorded)
+        │           │
+        │           ├── [First run: hasSuccessBatch() == false]
+        │           │     runFirstSync():
+        │           │     a. DELETE fault_record WHERE domain=? AND data_date=?
+        │           │     b. loop:
+        │           │          pull(domain, date, lastRank, 5000)
+        │           │          pull fail  → syncBatchRecordService.markPullFailed() → throw
+        │           │          pull ok    → syncBatchRecordService.markPullSuccess()
+        │           │                     → FaultDataProducer.sendBatch(...)
+        │           │                     → lastRank = max(response[].rank)
+        │           │                     → if response.size < 5000 → break
+        │           │     c. sync_task_record → MESSAGES_SENT (batchCount recorded)
+        │           │     d. checkAndMarkSuccessIfAllDone (producer-side race guard)
+        │           │
+        │           └── [Retry run: hasSuccessBatch() == true]
+        │                 runRetrySync():
+        │                 a. findFailed(domain, date) → FAILED rows from sync_batch_record
+        │                 b. pull_status=FAILED → re-pull from startRank to end (while loop)
+        │                    insert_status=FAILED → re-pull only that batch (single pull)
+        │                    (No DELETE; prior successful batches stay in DB)
+        │                 c. sync_task_record → MESSAGES_SENT + checkAndMarkSuccessIfAllDone
         │
         ▼
     CompletableFuture.allOf — wait all tasks, collect success/fail stats
@@ -62,11 +75,13 @@ FaultDataConsumer.onMessage(FaultDataBatchMessage)
         │
         ├── Convert DTOs → Entities
         ├── CollUtil.split(entities, 1000) → loop batchInsert (INSERT IGNORE)
+        ├── syncBatchRecordService.markInsertSuccess()
         └── syncTaskRecordService.incrementCompletedBatch()
               └── if completedBatchCount == batchCount → status = SUCCESS
 
 FaultDataDlqConsumer  (%DLQ%fault-data-sync-consumer)
-        └── mark sync_task_record → FAILED, log error (alert hook)
+        ├── syncBatchRecordService.markInsertFailed()   ← batch-level failure record
+        └── syncTaskRecordService.updateFailed()        ← triggers PowerJob retry
 ```
 
 ### Package Structure
@@ -79,9 +94,11 @@ org.cabbage.codedemo.faultdatasync/
 ├── service/
 │   ├── FaultSyncService.java
 │   ├── SyncTaskRecordService.java
+│   ├── SyncBatchRecordService.java        # Batch-level pull/insert status tracking
 │   └── impl/
-│       ├── FaultSyncServiceImpl.java      # Core loop: delete → pull → MQ send
-│       └── SyncTaskRecordServiceImpl.java # Full status lifecycle management
+│       ├── FaultSyncServiceImpl.java      # First/retry path split; pull loop with batch tracking
+│       ├── SyncTaskRecordServiceImpl.java # Full task status lifecycle management
+│       └── SyncBatchRecordServiceImpl.java
 ├── mq/
 │   ├── producer/
 │   │   └── FaultDataProducer.java
@@ -93,10 +110,12 @@ org.cabbage.codedemo.faultdatasync/
 │   └── MockFaultDataSourceClient.java     # Demo mock (configurable data volume)
 ├── entity/
 │   ├── FaultRecordEntity.java
-│   └── SyncTaskRecordEntity.java
+│   ├── SyncTaskRecordEntity.java
+│   └── SyncBatchRecordEntity.java         # pull_status + insert_status per batch
 ├── mapper/
 │   ├── FaultRecordMapper.java
-│   └── SyncTaskRecordMapper.java
+│   ├── SyncTaskRecordMapper.java
+│   └── SyncBatchRecordMapper.java
 ├── model/
 │   ├── FaultRecordDTO.java                # Upstream response DTO
 │   └── FaultDataBatchMessage.java         # MQ message body
@@ -149,6 +168,37 @@ CREATE TABLE sync_task_record (
 ) ENGINE=InnoDB;
 ```
 
+### sync_batch_record — Batch-Level Status Table
+
+Tracks pull and insert status for every 5k batch. Enables batch-granularity retry in `runRetrySync()`.
+DDL: `src/main/resources/db/sync_batch_record.sql`
+
+```sql
+CREATE TABLE sync_batch_record (
+    id            BIGINT AUTO_INCREMENT PRIMARY KEY,
+    domain        VARCHAR(64)  NOT NULL,
+    data_date     DATE         NOT NULL,
+    batch_index   INT          NOT NULL,               -- 0-based batch sequence
+    start_rank    BIGINT       NOT NULL,               -- pull cursor start
+    end_rank      BIGINT       NOT NULL DEFAULT 0,     -- max rank in this batch (filled on pull success)
+    record_count  INT          NOT NULL DEFAULT 0,
+    pull_status   VARCHAR(16)  NOT NULL DEFAULT 'PENDING', -- PENDING/SUCCESS/FAILED
+    insert_status VARCHAR(16)  NOT NULL DEFAULT 'PENDING', -- PENDING/SUCCESS/FAILED
+    error_message VARCHAR(500),
+    create_time   DATETIME,
+    update_time   DATETIME,
+    UNIQUE KEY uk_domain_date_batch (domain, data_date, batch_index)
+) ENGINE=InnoDB;
+```
+
+**Retry routing logic** (in `FaultSyncServiceImpl.syncDomainDate`):
+- `hasSuccessBatch(domain, date)` == false → first run → `runFirstSync()` (DELETE + full pull)
+- `hasSuccessBatch(domain, date)` == true  → retry run  → `runRetrySync()` (no DELETE, re-pull only failed batches)
+
+**Failed batch types** (in `runRetrySync`):
+- `pull_status=FAILED` → rank cursor broke; re-pull from `startRank` to end (while loop, covers all subsequent batches too)
+- `insert_status=FAILED` → only consumer failed; re-pull that single batch
+
 ### sync_task_record State Machine
 
 ```
@@ -156,12 +206,9 @@ CREATE TABLE sync_task_record (
                             │
                             ▼
                        ┌─────────┐
-                       │ PENDING │  Record upserted at syncDomainDate() entry
-                       └────┬────┘
-                            │  DELETE executed, pull loop starts
-                            ▼
-                       ┌─────────┐
-                       │ RUNNING │  DELETE done; rank-cursor loop in progress
+                       │ RUNNING │  createOrUpdateRunning() inserts directly as RUNNING
+                       └────┬────┘  (PENDING is defined in SyncStatus but never assigned)
+                            │  pull loop starts
                        └────┬────┘
                ┌────────────┴─────────────┐
        All batches pulled            pull() or sendBatch()
@@ -187,13 +234,13 @@ CREATE TABLE sync_task_record (
 
 | Status | Meaning | Set by |
 |--------|---------|--------|
-| PENDING | Record initialised, awaiting execution | `syncDomainDate()` entry upsert |
-| RUNNING | Producer loop executing (data window is empty during this phase) | After DELETE completes |
-| MESSAGES_SENT | All MQ messages sent; `batchCount` recorded; awaiting consumer | End of pull loop |
-| SUCCESS | All batches consumed and written to DB | `incrementCompletedBatch` atomic UPDATE |
-| FAILED | Producer exception **or** DLQ consumer triggered | Exception catch / `FaultDataDlqConsumer` |
+| PENDING | Defined in `SyncStatus` enum but **never assigned** in current code | — |
+| RUNNING | Record created/reset; pull loop in progress | `createOrUpdateRunning()` — record is created directly as RUNNING |
+| MESSAGES_SENT | All MQ messages sent; `batchCount` recorded; awaiting consumer | End of pull loop (`updateMessagesSent`) |
+| SUCCESS | All batches consumed and written to DB | `incrementCompletedBatch` atomic UPDATE or `checkAndMarkSuccessIfAllDone` |
+| FAILED | Pull exception **or** DLQ consumer triggered | Exception catch / `FaultDataDlqConsumer.markInsertFailed` |
 
-**Key guard**: `incrementCompletedBatch` uses `WHERE status = 'MESSAGES_SENT'`, so once a task is FAILED the consumer's progress updates become no-ops — preventing a partially-consumed failed task from accidentally flipping to SUCCESS.
+**Key guard**: `incrementCompletedBatch` uses `WHERE status IN ('RUNNING', 'MESSAGES_SENT')`, so once a task is FAILED the consumer's progress updates become no-ops. `batch_count > 0` guard prevents the RUNNING phase (where `batch_count=0`) from accidentally triggering SUCCESS.
 
 ---
 
@@ -225,10 +272,14 @@ This handles both PowerJob task re-runs and MQ message redelivery.
 ```sql
 UPDATE sync_task_record
 SET completed_batch_count = completed_batch_count + 1,
-    status = CASE WHEN completed_batch_count + 1 >= #{batchCount} THEN 'SUCCESS' ELSE status END,
-    end_time = CASE WHEN completed_batch_count + 1 >= #{batchCount} THEN NOW() ELSE end_time END
-WHERE domain = #{domain} AND data_date = #{dataDate} AND status = 'MESSAGES_SENT'
+    status = CASE WHEN completed_batch_count + 1 >= batch_count AND batch_count > 0 THEN 'SUCCESS' ELSE status END,
+    end_time = CASE WHEN completed_batch_count + 1 >= batch_count AND batch_count > 0 THEN NOW() ELSE end_time END
+WHERE domain = #{domain} AND data_date = #{dataDate} AND status IN ('RUNNING', 'MESSAGES_SENT')
 ```
+
+`batch_count > 0` guards against RUNNING phase (where `batch_count=0`) being mis-triggered as SUCCESS.
+`WHERE IN ('RUNNING', 'MESSAGES_SENT')` handles Consumer messages that arrive before `updateMessagesSent` completes.
+Producer also calls `checkAndMarkSuccessIfAllDone` after `updateMessagesSent` to handle the case where all batches were already consumed.
 
 ### MQ Reliability
 - **Retry**: `maxReconsumeTimes = 3` on `FaultDataConsumer`
@@ -251,30 +302,35 @@ WHERE domain = #{domain} AND data_date = #{dataDate} AND status = 'MESSAGES_SENT
 
 ## Failure Scenarios
 
-### Pull-phase failure (e.g. batch 4 of 8 throws exception)
+### Pull-phase failure (e.g. batch 3 of 8 throws exception, 0-indexed)
 
-1. Batches 1–3 are already in RocketMQ; consumers will INSERT IGNORE them into DB
-2. Exception caught in `syncDomainDate()` → `sync_task_record` → **FAILED**; `MESSAGES_SENT` is never set
-3. `incrementCompletedBatch` has `WHERE status = 'MESSAGES_SENT'` — since status is FAILED, all consumer updates are no-ops; task never reaches SUCCESS
-4. PowerJob task retry: DELETE all data for this domain+date → re-pull from `lastRank = 0`
-5. **No checkpoint resume**: the current design always restarts from the beginning; previously consumed batches 1–3 are deleted and re-pulled
+1. Batches 0–2 pulled and sent to MQ; `sync_batch_record` has `pull_status=SUCCESS` for them; consumers write them to DB
+2. Batch 3 `client.pull()` throws → `syncBatchRecordService.markPullFailed(domain, date, 3, startRank, err)`
+3. `sync_task_record` → **FAILED**; `MESSAGES_SENT` never set; `batchCount` not recorded
+4. `incrementCompletedBatch` WHERE guard (`status IN ('RUNNING','MESSAGES_SENT')`) blocks; task never reaches SUCCESS
+5. **PowerJob retry** → `createOrUpdateRunning()` resets to RUNNING; `hasSuccessBatch()=true` → `runRetrySync()`
+6. `findFailed()` returns batch 3 (`pull_status=FAILED`); re-pull from `batch3.startRank` in a while loop (covers batches 3–7)
+7. No DELETE executed; batches 0–2 data preserved in DB; INSERT IGNORE handles any duplicate MQ consumption
 
-### Consume-phase failure (e.g. batch 5 INSERT throws exception)
+### Consume-phase failure (e.g. batch 5 INSERT throws exception, 0-indexed)
 
-1. Pull loop is unaware of consumer results; all 8 batches are sent → `sync_task_record` → **MESSAGES_SENT(8)**
-2. Consumer fails for batch 5 → RocketMQ exponential back-off retry (×3); other batches consume independently
-3. After 3 retries: batch 5 routed to DLQ (`%DLQ%fault-data-sync-consumer`)
-4. `FaultDataDlqConsumer` → `sync_task_record` → **FAILED** + alert hook
-5. Final state: 7 batches in DB (35 000 rows), batch 5 missing; status = FAILED
-6. PowerJob task retry: DELETE + full re-pull + full re-consume → SUCCESS
+1. Pull loop unaware of consumer results; all 8 batches sent → all have `pull_status=SUCCESS` in `sync_batch_record`
+2. `sync_task_record` → **MESSAGES_SENT(8)**
+3. Consumer fails on batch 5 → RocketMQ exponential back-off retry (×3); other 7 batches consume independently, call `markInsertSuccess` + `incrementCompletedBatch`
+4. Batch 5 still fails after 3 retries → routed to DLQ
+5. `FaultDataDlqConsumer` → `syncBatchRecordService.markInsertFailed(domain, date, 5, err)` + `syncTaskRecordService.updateFailed()`
+6. `sync_task_record` → **FAILED**; other batches' `incrementCompletedBatch` become no-ops
+7. **PowerJob retry** → `hasSuccessBatch()=true` → `runRetrySync()`; `findFailed()` returns batch 5 (`insert_status=FAILED`)
+8. Re-pull only batch 5 (single pull from `startRank`); other 7 batches' data preserved; INSERT IGNORE handles duplicates
 
 ### Recovery layer summary
 
 | Layer | Handles | Cost |
 |-------|---------|------|
 | MQ auto-retry (×3) | Transient faults (DB blip, brief connection loss) | Low — single message only |
-| PowerJob task retry | Persistent faults (DB down, bug-fix re-run) | Full re-pull required |
-| DELETE + INSERT IGNORE | Idempotency guarantee for any number of re-runs | Brief empty window (acceptable) |
+| `sync_batch_record` + `runRetrySync` | Persistent batch failure; re-pull only failed batches | Minimal — no full re-pull, no DELETE |
+| PowerJob task retry | Any persistent fault — triggers `runRetrySync` on next run | Medium — re-pull failed batches only |
+| First-run DELETE + INSERT IGNORE | Idempotency for full re-runs; brief empty window | Acceptable for daily batch workload |
 
 ---
 
@@ -316,6 +372,7 @@ fault-sync:
 ```bash
 # 1. Init DB schema
 mysql -u root -p code_demo < src/main/resources/sql/init.sql
+mysql -u root -p code_demo < src/main/resources/db/sync_batch_record.sql
 
 # 2. Start the application
 cd fault-data-sync-demo

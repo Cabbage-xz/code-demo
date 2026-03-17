@@ -199,3 +199,42 @@ Use this template for each new entry:
   - `fault-data-sync-demo/MODULE_DOCS.md`
   - `fault-data-sync-demo/REQUESTS_AND_MODIFICATIONS.md`
 - **Status**: Completed
+
+---
+
+### Request 9: 同步三份文档至 sync_batch_record 批次级重试实装状态
+- **Date**: 2026-03-18
+- **Request Details**: 检查 INTERVIEW_PREP.md、MODULE_DOCS.md、REQUESTS_AND_MODIFICATIONS.md 与当前代码的差异，更新所有与实际代码不一致的描述。核心发现：`sync_batch_record` 表及批次级重试逻辑（`runFirstSync` / `runRetrySync`）已在代码中完整实现，但三份文档均将其描述为"提案"或"改造方向"，故障路径分析也仍停留在全量 DELETE 重跑的旧方案。
+
+  **主要差异点**：
+  1. `FaultSyncServiceImpl` 已拆分为 `runFirstSync()`（首次：DELETE + 全量拉取）和 `runRetrySync()`（重试：无 DELETE，按 `sync_batch_record` 只补失败批次）
+  2. `FaultDataConsumer` 消费成功后调用 `syncBatchRecordService.markInsertSuccess()`
+  3. `FaultDataDlqConsumer` 同时调用 `markInsertFailed()` + `updateFailed()`（而非仅 `updateFailed()`）
+  4. `FaultDataBatchMessage` 新增 `startRank` 字段供重试路径使用
+  5. `incrementCompletedBatch` WHERE 条件已放宽为 `IN ('RUNNING','MESSAGES_SENT')` 并加 `batch_count > 0` 守卫
+  6. `sync_task_record` 从未使用 PENDING 状态（`createOrUpdateRunning()` 直接写 RUNNING）
+
+- **Modification Made**:
+  - `MODULE_DOCS.md`：
+    - 架构流程图更新：FaultSyncServiceImpl 增加首次/重试分支；Consumer 加 `markInsertSuccess`；DLQ Consumer 加 `markInsertFailed`
+    - Package Structure 补充 `SyncBatchRecordEntity`、`SyncBatchRecordMapper`、`SyncBatchRecordService`、`SyncBatchRecordServiceImpl`
+    - 新增 `sync_batch_record` 表 DDL 章节及重试路由说明
+    - 状态机图及说明表更正 PENDING 状态（实际未使用）
+    - `incrementCompletedBatch` SQL 更正为实际版本（WHERE IN + `batch_count > 0` 守卫）
+    - Failure Scenarios 章节重写，反映批次级补跑实际行为；恢复层级表新增 `sync_batch_record + runRetrySync` 层
+    - Running Locally 补充 `sync_batch_record.sql` 初始化步骤
+  - `INTERVIEW_PREP.md`：
+    - 正常链路图：增加 `markPullSuccess` 步骤 + Producer 补偿检查步骤；Consumer 链路增加 `markInsertSuccess`
+    - 故障路径 A/B 图：重写为实际批次级续拉行为（路径A：从失败批次 startRank 续拉；路径B：仅补单批）
+    - 恢复层级对比表：新增 `sync_batch_record + runRetrySync` 层，删除"重拉全量数据"的旧描述
+    - "拉取阶段中途报错" Q：更正为"会从第4批续拉，当前实现支持批次级断点续拉"
+    - "MQ消费侧入库失败" Q：更正为"仅补跑第5批，不删除其他7批数据"
+    - 批次级补跑追问 Q：从"改造提案"重写为"当前实现的设计说明"，含 DDL 字段名修正（`start_rank`/`end_rank`/`pull_status`/`insert_status`）
+    - 示例数据流：更新为实际字段名和调用链
+
+- **Files Modified**:
+  - `fault-data-sync-demo/MODULE_DOCS.md`
+  - `fault-data-sync-demo/INTERVIEW_PREP.md`
+  - `fault-data-sync-demo/REQUESTS_AND_MODIFICATIONS.md`
+  - `fault-data-sync-demo/CLAUDE.md` (新增，/init 生成)
+- **Status**: Completed
