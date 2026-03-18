@@ -5,18 +5,18 @@ spring:
     driver-class-name: com.mysql.cj.jdbc.Driver
     url: jdbc:mysql://127.0.0.1:3306/code_demo?useUnicode=true&characterEncoding=UTF-8&rewriteBatchedStatements=true&allowMultiQueries=true&serverTimezone=Asia/Shanghai
     username: root
-    password: 1234567a
+    password: ${DB_PASSWORD:1234567a}
     # 二期分库时启用以下两个数据源，并激活 DynamicDataSourceConfig
     # beta:
     #   driver-class-name: com.mysql.cj.jdbc.Driver
     #   jdbc-url: jdbc:mysql://127.0.0.1:3306/code_demo_beta?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai
     #   username: root
-    #   password: 1234567a
+    #   password: ${DB_PASSWORD:1234567a}
     # comm:
     #   driver-class-name: com.mysql.cj.jdbc.Driver
     #   jdbc-url: jdbc:mysql://127.0.0.1:3306/code_demo_comm?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai
     #   username: root
-    #   password: 1234567a
+    #   password: ${DB_PASSWORD:1234567a}
 
 mybatis-plus:
   mapper-locations: classpath:mapper/**/*.xml

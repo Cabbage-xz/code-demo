@@ -4,7 +4,7 @@ spring:
   datasource:
     url: jdbc:mysql://127.0.0.1:3306/code_demo?useUnicode=true&characterEncoding=UTF-8&rewriteBatchedStatements=true&serverTimezone=Asia/Shanghai
     username: root
-    password: 1234567a
+    password: ${DB_PASSWORD:1234567a}
     driver-class-name: com.mysql.cj.jdbc.Driver
 
 # MyBatis-Plus
