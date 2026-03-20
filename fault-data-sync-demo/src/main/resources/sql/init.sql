@@ -24,7 +24,6 @@ CREATE TABLE IF NOT EXISTS sync_task_record (
     status                VARCHAR(20) NOT NULL   COMMENT 'PENDING/RUNNING/MESSAGES_SENT/SUCCESS/FAILED',
     batch_count           INT DEFAULT 0          COMMENT '已发送MQ批次总数',
     completed_batch_count INT DEFAULT 0          COMMENT '已成功插入DB的批次数',
-    total_records         INT DEFAULT 0          COMMENT '本次同步总记录数',
     retry_count           INT DEFAULT 0          COMMENT '重试次数',
     error_message         VARCHAR(500)           COMMENT '失败原因',
     start_time            DATETIME               COMMENT '同步开始时间',

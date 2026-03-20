@@ -59,7 +59,6 @@ public class FaultSyncServiceImpl implements FaultSyncService {
 
         long lastRank = 0;
         int batchIndex = 0;
-        int totalRecords = 0;
 
         try {
             while (true) {
@@ -80,12 +79,11 @@ public class FaultSyncServiceImpl implements FaultSyncService {
                 long endRank = records.stream().mapToLong(FaultRecordDTO::getRank).max().orElse(lastRank);
                 syncBatchRecordService.markPullSuccess(domain, date, batchIndex, startRank, endRank, records.size());
                 faultDataProducer.sendBatch(domain, date, batchIndex, startRank, records);
-                totalRecords += records.size();
                 lastRank = endRank;
                 batchIndex++;
 
-                log.debug("[Sync] domain={} date={} 已发送第 {} 批，本批 {} 条，累计 {} 条",
-                        domain, date, batchIndex, records.size(), totalRecords);
+                log.debug("[Sync] domain={} date={} 已发送第 {} 批，本批 {} 条",
+                        domain, date, batchIndex, records.size());
 
                 if (records.size() < pageSize) {
                     log.info("[Sync] domain={} date={} 最后一批（size={} < pageSize={}），拉取结束",
@@ -94,9 +92,8 @@ public class FaultSyncServiceImpl implements FaultSyncService {
                 }
             }
 
-            syncTaskRecordService.updateMessagesSent(domain, date, totalRecords, batchIndex);
-            log.info("[Sync] domain={} date={} 首次同步完成，共 {} 批，{} 条记录",
-                    domain, date, batchIndex, totalRecords);
+            syncTaskRecordService.updateMessagesSent(domain, date, batchIndex);
+            log.info("[Sync] domain={} date={} 首次同步完成，共 {} 批", domain, date, batchIndex);
             syncTaskRecordService.checkAndMarkSuccessIfAllDone(domain, date);
 
         } catch (Exception e) {
@@ -122,7 +119,6 @@ public class FaultSyncServiceImpl implements FaultSyncService {
             return;
         }
 
-        int totalRecords = 0;
         int sentBatchCount = 0;
 
         try {
@@ -147,7 +143,6 @@ public class FaultSyncServiceImpl implements FaultSyncService {
                         long endRank = records.stream().mapToLong(FaultRecordDTO::getRank).max().orElse(lastRank);
                         syncBatchRecordService.markPullSuccess(domain, date, batchIndex, startRank, endRank, records.size());
                         faultDataProducer.sendBatch(domain, date, batchIndex, startRank, records);
-                        totalRecords += records.size();
                         lastRank = endRank;
                         batchIndex++;
                         sentBatchCount++;
@@ -169,15 +164,13 @@ public class FaultSyncServiceImpl implements FaultSyncService {
                         long endRank = records.stream().mapToLong(FaultRecordDTO::getRank).max().orElse(startRank);
                         syncBatchRecordService.markPullSuccess(domain, date, batch.getBatchIndex(), startRank, endRank, records.size());
                         faultDataProducer.sendBatch(domain, date, batch.getBatchIndex(), startRank, records);
-                        totalRecords += records.size();
                         sentBatchCount++;
                     }
                 }
             }
 
-            syncTaskRecordService.updateMessagesSent(domain, date, totalRecords, sentBatchCount);
-            log.info("[Sync] domain={} date={} 重试同步完成，重发 {} 批，{} 条记录",
-                    domain, date, sentBatchCount, totalRecords);
+            syncTaskRecordService.updateMessagesSent(domain, date, sentBatchCount);
+            log.info("[Sync] domain={} date={} 重试同步完成，重发 {} 批", domain, date, sentBatchCount);
             syncTaskRecordService.checkAndMarkSuccessIfAllDone(domain, date);
 
         } catch (Exception e) {

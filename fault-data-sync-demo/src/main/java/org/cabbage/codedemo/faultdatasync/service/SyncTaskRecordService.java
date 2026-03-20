@@ -15,10 +15,9 @@ public interface SyncTaskRecordService {
     /**
      * 标记为 MESSAGES_SENT：所有 MQ 消息已发送完毕
      *
-     * @param batchCount   本次发送的 MQ 批次总数
-     * @param totalRecords 本次同步的总记录数
+     * @param batchCount 本次发送的 MQ 批次总数
      */
-    void updateMessagesSent(String domain, LocalDate dataDate, int totalRecords, int batchCount);
+    void updateMessagesSent(String domain, LocalDate dataDate, int batchCount);
 
     /**
      * 标记为 FAILED，记录错误信息

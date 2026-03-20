@@ -39,9 +39,6 @@ public class SyncTaskRecordEntity {
     /** 已成功插入 DB 的批次数 */
     private Integer completedBatchCount;
 
-    /** 本次同步总记录数 */
-    private Integer totalRecords;
-
     /** 重试次数 */
     private Integer retryCount;
 

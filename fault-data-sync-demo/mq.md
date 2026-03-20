@@ -176,3 +176,92 @@ DB 方案中 20 × 5 = 100 个子任务同时到达 INSERT 阶段，全部并发
 | 实现复杂度 | 高（重试触发、退避、DLQ 等均需手写） | 低（配置即得） |
 
 DB 状态追踪只解决了"知道失败了"的问题，没有解决"谁来重试、怎么重试、重试时不阻塞主流程"的问题，而这三个问题 MQ 是用框架级机制一并解决的。
+
+---
+
+# MQ 消费设计
+
+## 消费者配置
+
+| 配置项 | 值 | 说明 |
+|---|---|---|
+| topic | `fault-data-sync-topic` | 正常消费 topic |
+| consumerGroup | `fault-data-sync-consumer` | 消费组 |
+| maxReconsumeTimes | 3 | 超出后消息进入 DLQ |
+| DLQ topic | `%DLQ%fault-data-sync-consumer` | RocketMQ 自动创建 |
+
+---
+
+## 故障数据写库的幂等保障
+
+### 当前方案（MySQL）
+
+消费者通过两层机制保证故障数据不重复写入：
+
+1. **`INSERT IGNORE`**：写库语句统一使用 `INSERT IGNORE`
+2. **唯一索引**：`fault_record` 表有 `UNIQUE KEY uk_domain_date_rank(domain, data_date, rank)`
+
+`rank` 由上游数据源在 `(domain, date)` 维度内单调递增赋值，是故障记录的业务主键。任何场景下的重复写入（MQ 重投、PowerJob 重试重拉、消费者实例重平衡）都会被唯一索引静默拦截，不报错，不影响已有数据。
+
+**这是替换 `MockFaultDataSourceClient` 的契约前提**：真实数据源必须保证同一条故障记录的 `rank` 值在 `(domain, date)` 内稳定不变，否则幂等机制失效。
+
+### 若写入 ClickHouse
+
+ClickHouse 无唯一索引，`INSERT IGNORE` 语义不存在，需组合两个方案：
+
+**方案 A（应用层去重，主防线）**：消费者写 ClickHouse 前，先查 `sync_batch_record.insert_status`，若已为 `SUCCESS` 则跳过写入，直接调用 `incrementCompletedBatch` 后返回。`sync_batch_record` 保留在 MySQL 中充当消费状态账本，与存储引擎无关。
+
+**方案 B（ReplacingMergeTree，兜底）**：ClickHouse 表使用 `ReplacingMergeTree`，`ORDER BY (domain, data_date, rank)`，后台 Merge 时对相同 rank 的记录去重，查询加 `FINAL` 获得精确结果。用于兜底方案 A 未能拦截的极端场景。
+
+---
+
+## 已知极端边界场景：消费者并发重复消费
+
+### 场景描述
+
+```
+Consumer1: 查 insert_status → PENDING → 开始写 ClickHouse（耗时中）
+                                         ↓ 尚未调用 markInsertSuccess
+Consumer2: 同一条消息被重投 → 查 insert_status → 仍是 PENDING → 也开始写 ClickHouse
+                                                                  → 重复写入
+```
+
+### 触发条件（极端）
+
+RocketMQ 同一消费组内，同一条消息被两个消费者**同时**处理，仅在以下条件下发生：
+
+- Consumer1 的 `onMessage()` 处理时间超过 broker 消费超时（默认 **15 分钟**）仍未 ACK
+- broker 判定该消费者超时，将消息重新投递给组内另一个实例
+
+正常链路（ClickHouse 写入秒级完成）不会触发此条件。
+
+### 解决方案（若需严格防御）
+
+在 `insert_status` 中引入 `INSERTING` 中间态，消费者写库前通过 CAS 原子抢占：
+
+```sql
+-- 抢占：只有 PENDING/FAILED 状态可以抢到
+UPDATE sync_batch_record
+SET insert_status = 'INSERTING', update_time = NOW()
+WHERE domain = ? AND data_date = ? AND batch_index = ?
+  AND insert_status IN ('PENDING', 'FAILED')
+```
+
+- `affected = 1`：本消费者独占，继续写 ClickHouse，完成后改为 `SUCCESS`，失败改回 `FAILED`
+- `affected = 0`：查当前状态；若 `SUCCESS` 则直接 `incrementCompletedBatch` 返回；若 `INSERTING` 则说明另一消费者正在处理，直接返回 OK
+
+**INSERTING 卡死兜底**：`findFailed` 查询需加超时条件，将 `update_time` 超过阈值（如 30 分钟）的 `INSERTING` 记录视为失败，纳入 PowerJob 重试范围：
+
+```sql
+OR (insert_status = 'INSERTING' AND update_time < NOW() - INTERVAL 30 MINUTE)
+```
+
+### 当前选择
+
+当前代码未实现上述防御，理由：
+
+1. 触发条件（onMessage 超时 15 分钟）在正常写入链路下不可达
+2. 即使触发，ClickHouse 侧的 ReplacingMergeTree 兜底可在 Merge 时消除重复数据
+3. 引入 `INSERTING` 状态会增加消费者逻辑复杂度和额外的 MySQL 写压力
+
+若后续 ClickHouse 写入出现长尾耗时（超分钟级），应重新评估是否启用此方案。

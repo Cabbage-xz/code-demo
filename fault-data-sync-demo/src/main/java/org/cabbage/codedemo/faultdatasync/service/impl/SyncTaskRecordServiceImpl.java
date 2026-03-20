@@ -30,7 +30,6 @@ public class SyncTaskRecordServiceImpl implements SyncTaskRecordService {
                     .status(SyncStatus.RUNNING.name())
                     .batchCount(0)
                     .completedBatchCount(0)
-                    .totalRecords(0)
                     .retryCount(0)
                     .startTime(LocalDateTime.now())
                     .build();
@@ -52,15 +51,13 @@ public class SyncTaskRecordServiceImpl implements SyncTaskRecordService {
     }
 
     @Override
-    public void updateMessagesSent(String domain, LocalDate dataDate, int totalRecords, int batchCount) {
+    public void updateMessagesSent(String domain, LocalDate dataDate, int batchCount) {
         syncTaskRecordMapper.update(null, new LambdaUpdateWrapper<SyncTaskRecordEntity>()
                 .eq(SyncTaskRecordEntity::getDomain, domain)
                 .eq(SyncTaskRecordEntity::getDataDate, dataDate)
                 .set(SyncTaskRecordEntity::getStatus, SyncStatus.MESSAGES_SENT.name())
-                .set(SyncTaskRecordEntity::getTotalRecords, totalRecords)
                 .set(SyncTaskRecordEntity::getBatchCount, batchCount));
-        log.info("[SyncTask] domain={} date={} → MESSAGES_SENT, batches={}, records={}",
-                domain, dataDate, batchCount, totalRecords);
+        log.info("[SyncTask] domain={} date={} → MESSAGES_SENT, batches={}", domain, dataDate, batchCount);
     }
 
     @Override
