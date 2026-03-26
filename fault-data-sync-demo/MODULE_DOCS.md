@@ -75,9 +75,10 @@ FaultDataConsumer.onMessage(FaultDataBatchMessage)
         │
         ├── Convert DTOs → Entities
         ├── CollUtil.split(entities, 1000) → loop batchInsert (INSERT IGNORE)
-        ├── syncBatchRecordService.markInsertSuccess()
-        └── syncTaskRecordService.incrementCompletedBatch()
-              └── if completedBatchCount == batchCount → status = SUCCESS
+        ├── syncBatchRecordService.markInsertSuccess()   ← WHERE insert_status != 'SUCCESS'
+        │     affected=1 (首次) → syncTaskRecordService.incrementCompletedBatch()
+        │     affected=0 (重复消费) → 跳过计数，防 completed_batch_count 虚高
+        └── incrementCompletedBatch: if completedBatchCount == batchCount → status = SUCCESS
 
 FaultDataDlqConsumer  (%DLQ%fault-data-sync-consumer)
         ├── syncBatchRecordService.markInsertFailed()   ← batch-level failure record
@@ -253,12 +254,13 @@ CREATE TABLE sync_batch_record (
 
 ### Idempotency (layered)
 
-| Layer | Mechanism |
-|-------|-----------|
-| Primary | Full overwrite: DELETE before INSERT for each domain+date |
-| Safety net | INSERT IGNORE + unique index `(domain, data_date, rank)` |
+| Layer | Mechanism | Protects Against |
+|-------|-----------|-----------------|
+| Primary | Full overwrite: DELETE before INSERT for each domain+date | PowerJob task re-runs |
+| State-check | `markInsertSuccess` uses `WHERE insert_status != 'SUCCESS'`; skips `incrementCompletedBatch` when `affected=0` | MQ redelivery causing double-counting in `completed_batch_count` |
+| Safety net | INSERT IGNORE + unique index `(domain, data_date, rank)` | Duplicate data writes from any source |
 
-This handles both PowerJob task re-runs and MQ message redelivery.
+All three layers are needed: DELETE ensures data freshness on full re-run; the state-check prevents progress counter inflation on redelivery; INSERT IGNORE provides DB-level dedup as a final backstop.
 
 ### Parallelism & Back-pressure
 - **Domain-level parallelism**: each domain has its own PowerJob task; PowerJob concurrently schedules up to 20 task instances
@@ -293,7 +295,7 @@ Producer also calls `checkAndMarkSuccessIfAllDone` after `updateMessagesSent` to
 | Scenario | Handling |
 |----------|---------|
 | PowerJob full task re-run | Re-delete + re-insert, naturally idempotent |
-| MQ message redelivery (same 5k batch) | `INSERT IGNORE` + unique index prevents duplicates |
+| MQ message redelivery (same 5k batch) | `INSERT IGNORE` prevents data duplicates; `markInsertSuccess` `affected=0` skips `incrementCompletedBatch`, preventing counter inflation |
 | Partial DB insert failure | MQ retries the entire batch; `INSERT IGNORE` skips already-inserted rows |
 | Upstream API timeout/error | Exception propagates → task marked `FAILED`; PowerJob task-level retry |
 | DLQ (exceeded max retries) | `FaultDataDlqConsumer` marks `FAILED`; extendable to alerting |

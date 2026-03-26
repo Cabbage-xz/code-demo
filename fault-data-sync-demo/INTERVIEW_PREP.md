@@ -32,7 +32,7 @@
 
 第三，**各领域独立 PowerJob 任务**。没有做一个大任务处理所有 20 个领域，而是每个领域配置独立的定时任务，共用一个通用处理器，通过 instanceParams 传入领域名称。这样失败隔离粒度到领域级，每个领域可以独立配置 cron、超时和重试策略。处理器内部用 CompletableFuture + 共享有界线程池并发执行 5 个日期任务，CallerRunsPolicy 在多域任务并发争抢线程池时自然产生背压。
 
-第四，**幂等双保险**。主策略是每次同步前先 DELETE 该 domain+date 的旧数据再全量插入，天然幂等支持任意重跑。安全兜底是 fault_record 上的联合唯一索引 `(domain, data_date, rank)` + INSERT IGNORE，防止 MQ 消息重投时重复写入。
+第四，**幂等三重保障**。主策略是每次同步前先 DELETE 该 domain+date 的旧数据再全量插入，天然幂等支持任意重跑。第二层是 `markInsertSuccess` 使用条件 UPDATE（`WHERE insert_status != 'SUCCESS'`），返回 affected rows，Consumer 仅在 affected=1 时推进完成计数，防止 MQ 重复投递导致 completed_batch_count 虚高、任务永远无法到达 SUCCESS。第三层是 fault_record 上的联合唯一索引 `(domain, data_date, rank)` + INSERT IGNORE 兜底数据层重复写入。
 
 **进度跟踪**：设计了 sync_task_record 表，状态机为 PENDING → RUNNING → MESSAGES_SENT → SUCCESS / FAILED。MESSAGES_SENT 是关键哨兵状态，表示生产侧已完成、消费侧正在追；Consumer 每消费完一批用一条原子 UPDATE + CASE WHEN SQL 推进计数，全部消费完自动翻到 SUCCESS，不依赖分布式锁。
 
@@ -65,8 +65,8 @@
 
 每个领域在 PowerJob 中配置各自的定时任务，均指向同一个通用处理器 `FaultDataSyncJob`，通过 `instanceParams` 传入该领域的专属参数（domain 名称、同步天数）。领域级别的并行由 PowerJob 并发调度 20 个任务实例实现，单个处理器内部仅对 5 个日期并发执行（CompletableFuture + 共享有界线程池 20 线程），正常场景全链路约 **2 分钟**完成 20 域所有数据。单域5天任务共享 20 线程有界线程池，PowerJob 同时调起多个域任务时 pool 充当全局并发限速器。顶峰场景（100万条/domain/date）全链路约 **15-20 分钟**，相比原来串行方案预估的 **6+ 小时**，缩短了 **95% 以上**。
 
-**④ 幂等双保险。**
-主策略是每次同步前先 DELETE 该 domain+date 的旧数据，天然幂等，支持 PowerJob 任意重跑。安全兜底是在 fault_record 上加了联合唯一索引 `(domain, data_date, rank)` + INSERT IGNORE，防 MQ 消息重投导致重复写入。
+**④ 幂等三重保障。**
+主策略是每次同步前先 DELETE 该 domain+date 的旧数据，天然幂等，支持 PowerJob 任意重跑。第二层是 `markInsertSuccess` 条件 UPDATE（`WHERE insert_status != 'SUCCESS'`），依据 affected rows 决定是否推进完成计数，防 MQ 重复投递导致 completed_batch_count 虚高。第三层是 fault_record 联合唯一索引 `(domain, data_date, rank)` + INSERT IGNORE，DB 层兜底数据重复写入。
 
 **⑤ 可靠性保障。**
 MQ 消费失败自动重试 3 次，超限进 DLQ，DLQ Consumer 将 sync_task_record 状态置为 FAILED 并预留告警钩子。sync_task_record 表用单条原子 UPDATE + CASE WHEN 跟踪批次完成进度，避免分布式锁依赖。
@@ -146,7 +146,9 @@ MQ 消费失败自动重试 3 次，超限进 DLQ，DLQ Consumer 将 sync_task_r
 │  │  MQ 消费层                                                               │   │
 │  │  FaultDataConsumer  (@RocketMQMessageListener, maxReconsumeTimes=3)      │   │
 │  │    CollUtil.split(1000) → batchInsert(INSERT IGNORE)                     │   │
-│  │    → incrementCompletedBatch → status = SUCCESS                          │   │
+│  │    → markInsertSuccess(WHERE insert_status!='SUCCESS')                   │   │
+│  │      affected=1 → incrementCompletedBatch → status = SUCCESS             │   │
+│  │      affected=0 → 重复消费，跳过计数                                      │   │
 │  │  FaultDataDlqConsumer  (订阅 %DLQ%fault-data-sync-consumer)              │   │
 │  │    → status = FAILED + 告警钩子（钉钉 / 邮件 / PagerDuty 可扩展）        │   │
 │  └─────────────────────────────────┬────────────────────────────────────────┘   │
@@ -243,14 +245,20 @@ MQ 消费失败自动重试 3 次，超限进 DLQ，DLQ Consumer 将 sync_task_r
            │                                                            │
            │  [C] syncBatchRecordService.markInsertSuccess(            │
            │        domain, date, batchIndex)                          │
+           │      UPDATE sync_batch_record                              │
+           │      SET insert_status='SUCCESS'                           │
+           │      WHERE ... AND insert_status != 'SUCCESS'  ← 幂等条件 │
+           │      → affected=1（首次），affected=0（重复消费）           │
            │                                                            │
-           │  [D] syncTaskRecordService.incrementCompletedBatch()      │
-           │      UPDATE sync_task_record                               │
-           │      SET completed_batch_count = completed_batch_count + 1,│
-           │          status = CASE WHEN completed_batch_count+1 >= N  │
-           │                        THEN 'SUCCESS' ELSE status END     │
-           │      WHERE domain=? AND data_date=? AND status='MESSAGES_SENT' │
-           │      → completed_batch_count == N 时 → status = SUCCESS ✓ │
+           │  [D] if (affected > 0)                                    │
+           │        syncTaskRecordService.incrementCompletedBatch()    │
+           │        UPDATE sync_task_record                             │
+           │        SET completed_batch_count = completed_batch_count+1,│
+           │            status = CASE WHEN ... THEN 'SUCCESS' END      │
+           │        WHERE ... AND status IN ('RUNNING','MESSAGES_SENT')│
+           │        → completed_batch_count == N → status = SUCCESS ✓  │
+           │      else  ← affected=0，重复消费，跳过，防计数虚高        │
+           │        log.warn("重复消费，跳过计数更新")                   │
            └────────────────────────────────────────────────────────────┘
 ```
 
@@ -514,19 +522,22 @@ rank 游标要求数据有一个单调递增、不重复的排序字段。如果
 
 ---
 
-**Q3：幂等是怎么设计的？为什么要两层保障？**
+**Q3：幂等是怎么设计的？为什么要三层保障？**
 
 **A：**
 
 第一层：**全量覆盖**。每次同步开始前先 `DELETE FROM fault_record WHERE domain=? AND data_date=?`，把该 domain+date 的旧数据全部清掉，然后重新插入。这样无论 PowerJob 任务重跑多少次，最终结果都是最新一次拉取的数据，天然幂等。
 
-第二层：**INSERT IGNORE + 唯一索引**。在 `(domain, data_date, rank)` 上建联合唯一索引，INSERT 时用 INSERT IGNORE。当 MQ 消息因网络抖动重投时，Consumer 会重新执行 batchInsert，但已经入库的记录不会被重复写入（唯一索引冲突时 IGNORE 跳过）。
+第二层：**markInsertSuccess 条件 UPDATE + affected rows**。`markInsertSuccess` 内部使用 `WHERE insert_status != 'SUCCESS'` 条件更新，返回 affected rows。Consumer 仅在 affected=1（首次消费）时调用 `incrementCompletedBatch`，affected=0（重复消费）时直接跳过。这是防止 MQ 重复投递导致 `completed_batch_count` 虚高的核心屏障——数据层 INSERT IGNORE 能防重写，但拦不住计数被重复自增。
 
-为什么两层都要？
-- 只有第一层（delete+insert）：MQ 消息重投时，DELETE 已经在第一轮执行过了，第二轮消费的 INSERT 仍会产生重复。
-- 只有第二层（唯一索引）：如果历史数据发生了修改（同一 domain+data_date+rank 的 fault_detail 变了），INSERT IGNORE 会静默跳过，导致旧数据不被更新。全量 DELETE 则确保了数据的新鲜度。
+第三层：**INSERT IGNORE + 唯一索引**。在 `(domain, data_date, rank)` 上建联合唯一索引，INSERT 时用 INSERT IGNORE。唯一索引在 DB 层兜底，任何绕过上层检查的重复写入都会被静默拦截。
 
-两层配合：DELETE 保鲜度，IGNORE 防重复。
+为什么三层都要？
+- 只有第一层（DELETE）：MQ 消息重投时，DELETE 已在第一轮执行过，第二轮消费的 INSERT 仍会产生重复，且计数也会虚高。
+- 只有第三层（唯一索引）：数据不重复，但 `incrementCompletedBatch` 没有保护，重复消费会让计数超过 batchCount，SUCCESS 判断失效；同时历史数据有修改时 INSERT IGNORE 会静默跳过，数据不更新。
+- 第二层是中间的关键：在数据写入之后、计数推进之前用状态字段做门控，把"首次消费"和"重复消费"区分开来。
+
+三层分工：DELETE 保数据鲜度，条件 UPDATE 保计数准确，INSERT IGNORE 保数据不重写。
 
 ---
 
@@ -1080,15 +1091,25 @@ INSERT IGNORE 本身每条语句都是自动提交的，如果不加 `@Transacti
 
 实现方式：
 
-**① 数据库唯一索引**（我们用的方案）：把业务唯一键作为 DB 唯一索引，INSERT IGNORE / ON DUPLICATE KEY UPDATE，天然防重。适合写 DB 的场景。
+**① 数据库唯一索引**：把业务唯一键作为 DB 唯一索引，INSERT IGNORE / ON DUPLICATE KEY UPDATE，天然防重。适合写 DB 的场景。
 
 **② 消息去重表**：消费前先查去重表（messageId → 处理状态），已处理的跳过，未处理的先插入去重记录再处理。但涉及两次 DB 操作，需要注意原子性。
 
 **③ Redis SETNX**：以 messageId 为 key，SETNX（Set if Not eXists）成功才处理。高性能，但 Redis 不持久化时有风险，且 Redis 和 DB 的操作不是原子的。
 
-**④ 状态机**：消费者维护状态，比如我们的 sync_task_record，`WHERE status = 'MESSAGES_SENT'` 限定了 UPDATE 只对特定状态生效，重复执行状态不匹配时 UPDATE 影响行数为 0，自然是幂等的。
+**④ 状态机 / 条件 UPDATE**：消费者对状态字段做条件更新，依据 affected rows 决定后续动作。重复消费时 affected=0，自然跳过后续逻辑，幂等天然成立。我们项目用的就是这种方式：
 
-选哪种取决于场景。对我们的批量写入场景，唯一索引 + INSERT IGNORE 最简单直接。
+```java
+// markInsertSuccess 内部：WHERE insert_status != 'SUCCESS'
+int affected = syncBatchRecordService.markInsertSuccess(domain, date, batchIndex);
+if (affected > 0) {
+    syncTaskRecordService.incrementCompletedBatch(domain, date); // 首次消费才推进计数
+} else {
+    log.warn("重复消费，跳过计数更新");  // 防止 completed_batch_count 虚高
+}
+```
+
+唯一索引 + INSERT IGNORE 防止数据层重复写入（第一个问题），条件 UPDATE + affected rows 防止状态层重复更新（第二个问题）。两个问题需要分别处理，只靠 INSERT IGNORE 不够。
 
 ---
 
@@ -1133,4 +1154,4 @@ INSERT IGNORE 本身每条语句都是自动提交的，如果不加 `@Transacti
 | incrementCompletedBatch 无锁 | MySQL UPDATE 行锁天然串行，SET x=x+1 原子 |
 | CompletableFuture 优于 Future | 支持非阻塞组合、链式操作、统一异常处理 |
 | 批量INSERT为什么快 | 减少网络往返 + 减少事务提交次数 + rewriteBatchedStatements |
-| 幂等三层 | delete全量覆盖（重跑幂等）→ INSERT IGNORE（重投幂等）→ status机器（状态幂等） |
+| 幂等三层 | delete全量覆盖（重跑幂等）→ markInsertSuccess条件UPDATE+affected rows（防计数虚高）→ INSERT IGNORE数据层兜底 |

@@ -61,14 +61,20 @@ public class SyncBatchRecordServiceImpl implements SyncBatchRecordService {
     }
 
     @Override
-    public void markInsertSuccess(String domain, LocalDate dataDate, int batchIndex) {
-        syncBatchRecordMapper.update(null, new LambdaUpdateWrapper<SyncBatchRecordEntity>()
+    public int markInsertSuccess(String domain, LocalDate dataDate, int batchIndex) {
+        int affected = syncBatchRecordMapper.update(null, new LambdaUpdateWrapper<SyncBatchRecordEntity>()
                 .eq(SyncBatchRecordEntity::getDomain, domain)
                 .eq(SyncBatchRecordEntity::getDataDate, dataDate)
                 .eq(SyncBatchRecordEntity::getBatchIndex, batchIndex)
+                .ne(SyncBatchRecordEntity::getInsertStatus, "SUCCESS")   // 幂等：已成功则跳过
                 .set(SyncBatchRecordEntity::getInsertStatus, "SUCCESS")
                 .set(SyncBatchRecordEntity::getUpdateTime, LocalDateTime.now()));
-        log.debug("[BatchRecord] insert SUCCESS domain={} date={} batch={}", domain, dataDate, batchIndex);
+        if (affected > 0) {
+            log.debug("[BatchRecord] insert SUCCESS domain={} date={} batch={}", domain, dataDate, batchIndex);
+        } else {
+            log.warn("[BatchRecord] insert 重复消费跳过 domain={} date={} batch={}", domain, dataDate, batchIndex);
+        }
+        return affected;
     }
 
     @Override

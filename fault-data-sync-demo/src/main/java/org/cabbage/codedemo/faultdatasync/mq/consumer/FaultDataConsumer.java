@@ -57,11 +57,18 @@ public class FaultDataConsumer implements RocketMQListener<FaultDataBatchMessage
         log.info("[Consumer] domain={} date={} batchIndex={} 写入完成，共 {} 条",
                 msg.getDomain(), msg.getDataDate(), msg.getBatchIndex(), entities.size());
 
-        // 更新批次入库状态
-        syncBatchRecordService.markInsertSuccess(msg.getDomain(), msg.getDataDate(), msg.getBatchIndex());
+        // 幂等状态更新：markInsertSuccess 内部加 ne(insert_status, SUCCESS) 条件
+        // affected=1 表示首次成功；affected=0 表示重复消费，跳过计数推进，防止 completed_batch_count 虚高
+        int affected = syncBatchRecordService.markInsertSuccess(
+                msg.getDomain(), msg.getDataDate(), msg.getBatchIndex());
 
-        // 通知进度跟踪：已完成批次 +1，若全部完成则自动置为 SUCCESS
-        syncTaskRecordService.incrementCompletedBatch(msg.getDomain(), msg.getDataDate());
+        if (affected > 0) {
+            // 通知进度跟踪：已完成批次 +1，若全部完成则自动置为 SUCCESS
+            syncTaskRecordService.incrementCompletedBatch(msg.getDomain(), msg.getDataDate());
+        } else {
+            log.warn("[Consumer] 重复消费，跳过计数更新 domain={} date={} batchIndex={}",
+                    msg.getDomain(), msg.getDataDate(), msg.getBatchIndex());
+        }
     }
 
     private List<FaultRecordEntity> convertToEntities(FaultDataBatchMessage msg) {

@@ -11,6 +11,7 @@
     <groupId>org.cabbage.codedemo</groupId>
     <artifactId>code-demo</artifactId>
     <version>0.0.1-SNAPSHOT</version>
+    <packaging>pom</packaging>
     <name>code-demo</name>
     <description>code-demo</description>
     <url/>
@@ -70,6 +71,7 @@
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
                 <configuration>
+                    <skip>true</skip>
                     <excludes>
                         <exclude>
                             <groupId>org.projectlombok</groupId>

@@ -33,8 +33,9 @@ PowerJob (cron, per domain)
                                                       ↓ RocketMQ
                                               FaultDataConsumer.onMessage()
                                                 ├─ INSERT IGNORE in chunks of 1000
-                                                ├─ syncBatchRecordService.markInsertSuccess()
-                                                └─ syncTaskRecordService.incrementCompletedBatch()
+                                                ├─ syncBatchRecordService.markInsertSuccess()   ← WHERE insert_status!='SUCCESS', returns affected rows
+                                                └─ affected>0 → syncTaskRecordService.incrementCompletedBatch()
+                                                   affected=0 → 重复消费，跳过计数（防 completed_batch_count 虚高）
                                                       ↓ (on maxReconsumeTimes=3 exceeded)
                                               FaultDataDlqConsumer.onMessage()
                                                 ├─ syncBatchRecordService.markInsertFailed()

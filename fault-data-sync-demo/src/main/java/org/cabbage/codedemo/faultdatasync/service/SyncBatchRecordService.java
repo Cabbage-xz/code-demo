@@ -21,8 +21,16 @@ public interface SyncBatchRecordService {
     void markPullFailed(String domain, LocalDate dataDate, int batchIndex,
                         long startRank, String errorMessage);
 
-    /** 消费入库成功：insert_status=SUCCESS */
-    void markInsertSuccess(String domain, LocalDate dataDate, int batchIndex);
+    /**
+     * 消费入库成功：幂等地将 insert_status 置为 SUCCESS。
+     * <p>
+     * 内部使用 {@code WHERE insert_status != 'SUCCESS'} 条件更新，
+     * 返回受影响行数：1 表示首次成功，0 表示该批次已处理过（重复消费）。
+     * 调用方应根据返回值决定是否继续调用 incrementCompletedBatch，避免计数虚高。
+     *
+     * @return 受影响行数（0 = 重复消费，无需再推进完成计数）
+     */
+    int markInsertSuccess(String domain, LocalDate dataDate, int batchIndex);
 
     /** 消费入库失败（进 DLQ）：insert_status=FAILED */
     void markInsertFailed(String domain, LocalDate dataDate, int batchIndex, String errorMessage);

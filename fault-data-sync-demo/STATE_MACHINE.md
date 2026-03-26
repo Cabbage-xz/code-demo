@@ -115,7 +115,9 @@ insert_status: PENDING → SUCCESS / FAILED
 #### `PENDING → SUCCESS`
 - **方法**：`SyncBatchRecordServiceImpl.markInsertSuccess(domain, date, batchIndex)`
 - **调用方**：`FaultDataConsumer.onMessage()` 批次全部 INSERT IGNORE 完成后
-- **行为**：insert_status→SUCCESS
+- **行为**：条件 UPDATE `WHERE insert_status != 'SUCCESS'`，返回 affected rows
+  - `affected = 1`：首次消费，insert_status→SUCCESS，调用方继续调用 `incrementCompletedBatch`
+  - `affected = 0`：重复消费检测到，调用方跳过 `incrementCompletedBatch`，防止 completed_batch_count 虚高
 
 #### `PENDING → FAILED`
 - **方法**：`SyncBatchRecordServiceImpl.markInsertFailed(domain, date, batchIndex, errorMessage)`
@@ -162,7 +164,9 @@ syncDomainDate(domain, date)
 
   FaultDataConsumer.onMessage(batch)
     ├─ INSERT IGNORE fault_record（分 1000 条一块）
-    ├─ markInsertSuccess()              [sync_batch_record] insert_status → SUCCESS
+    ├─ markInsertSuccess()              [sync_batch_record] WHERE insert_status!='SUCCESS'
+    │    affected=1（首次）→ insert_status → SUCCESS
+    │    affected=0（重复消费）→ 跳过后续计数更新，直接返回
     └─ incrementCompletedBatch()        [sync_task_record]  completed_batch_count++
                                          → status → SUCCESS（若为最后一批）
 
@@ -214,6 +218,7 @@ syncDomainDate(domain, date)
 | 多消费者并发 increment | 最后一次 +1 可能被多个线程同时执行 | 原子 CASE 语句在单条 UPDATE 中判断并翻转状态，无需应用层加锁 |
 | 生产者和消费者同时尝试写 SUCCESS | 重复更新 | WHERE status = 'MESSAGES_SENT' 保证只有第一个执行成功，后续更新行数为 0 |
 | incrementCompletedBatch 时任务已 FAILED | 多余的成功计数 | WHERE status IN ('RUNNING', 'MESSAGES_SENT') 排除 FAILED 状态 |
+| MQ 重复投递（同一批次消费两次） | INSERT IGNORE 防数据重写，但 incrementCompletedBatch 仍会重复执行，导致 completed_batch_count 虚高，SUCCESS 永远触发不了 | markInsertSuccess 加 `WHERE insert_status != 'SUCCESS'` 条件，affected=0 时跳过 incrementCompletedBatch |
 
 ---
 
@@ -235,6 +240,7 @@ findFailed() 返回的批次列表，按 batchIndex 升序处理：
 
 ## 七、关键幂等设计
 
-- `fault_record` 有 `UNIQUE KEY uk_domain_date_rank(domain, data_date, rank)`，消费者统一使用 INSERT IGNORE
-- `sync_batch_record` 使用 `INSERT ... ON DUPLICATE KEY UPDATE`，markPullSuccess 可安全重入
-- 首次同步前执行 DELETE 清空旧数据，配合 INSERT IGNORE 实现全量覆写语义
+- **全量覆写**：首次同步前执行 DELETE 清空旧数据，保证 PowerJob 任意重跑后数据新鲜度
+- **状态层防重**：`markInsertSuccess` 使用 `WHERE insert_status != 'SUCCESS'` 条件 UPDATE，返回 affected rows；Consumer 仅在 affected=1 时调用 `incrementCompletedBatch`，防止 MQ 重复投递导致计数虚高
+- **数据层兜底**：`fault_record` 有 `UNIQUE KEY uk_domain_date_rank(domain, data_date, rank)`，消费者统一使用 INSERT IGNORE，唯一索引在 DB 层拦截任何重复写入
+- **pull 幂等**：`sync_batch_record` 使用 `INSERT ... ON DUPLICATE KEY UPDATE`，markPullSuccess 可安全重入
